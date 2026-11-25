@@ -9,7 +9,7 @@ local pending = false
 -- und die Kategorienamen in Reihenfolge der Liste.
 local function classicCategories()
 	if not (GetNumTradeSkills and GetTradeSkillInfo and GetTradeSkillRecipeLink) then return nil end
-	local map, order, seen, cur = {}, {}, {}, nil
+	local map, order, seen, cur, diffs = {}, {}, {}, nil, {}
 	local n = GetNumTradeSkills() or 0
 	for i = 1, n do
 		local ok, name, kind = pcall(GetTradeSkillInfo, i)
@@ -20,12 +20,15 @@ local function classicCategories()
 			elseif cur then
 				local okl, link = pcall(GetTradeSkillRecipeLink, i)
 				local id = okl and link and tonumber(link:match("enchant:(%d+)") or link:match("spell:(%d+)"))
-				if id then map[id] = cur end
+				if id then
+					map[id] = cur
+					diffs[id] = ({ optimal = 0, medium = 1, easy = 2, trivial = 3 })[kind]
+				end
 			end
 		end
 	end
 	if #order == 0 then return nil end
-	return map, order
+	return map, order, diffs
 end
 
 local function scanOpenProfession()
@@ -58,7 +61,8 @@ local function scanOpenProfession()
 	-- darf nicht als solcher gespeichert werden (sonst landen Rezepte eines anderen Berufs dort).
 	if not ns.IsCrafting(pname or key) then return false end
 
-	local recipes, count, cidOf = {}, 0, {}
+	local recipes, count, cidOf, sig = {}, 0, {}, 0
+	local _, _, classicDiff = classicCategories()
 	for _, id in ipairs(ids) do
 		local okr, info = pcall(C_TradeSkillUI.GetRecipeInfo, id)
 		if okr and type(info) == "table" and info.learned then
@@ -81,6 +85,11 @@ local function scanOpenProfession()
 					end
 				end
 			end
+			-- Schwierigkeit fuer diese Figur: 0 orange, 1 gelb, 2 gruen, 3 grau
+			local d = tonumber(info.relativeDifficulty)
+			if d == nil and classicDiff then d = classicDiff[id] end
+			if d and d >= 0 and d <= 3 then rec.d = math.floor(d) end
+			sig = sig + (id % 9973) * ((rec.d or 4) + 1)
 			recipes[id] = rec
 			cidOf[id] = tonumber(info.categoryID)
 			count = count + 1
@@ -151,8 +160,11 @@ local function scanOpenProfession()
 	prof.recipes = recipes
 	prof.count = count
 	prof.cats = cats
+	local newSig = count .. ":" .. sig
+	local changed = prof.sig ~= newSig
+	prof.sig = newSig
 	c.profs[key] = prof
-	return true
+	return true, changed
 end
 
 -- Rang/Maximum aller Berufe (auch ohne geoeffnetes Berufsfenster).
@@ -179,12 +191,13 @@ end
 
 function Scan.Run(verbose)
 	pending = false
-	local ok = scanOpenProfession()
+	local ok, changed = scanOpenProfession()
 	scanRanks()
 	if ok then
 		local c = ns.GetChar(ns.Me())
 		c.updated = time()
-		if ns.Comm then ns.Comm.QueueBroadcast() end
+		-- nur senden, wenn sich Rezepte oder Schwierigkeiten geaendert haben
+		if changed and ns.Comm then ns.Comm.QueueBroadcast() end
 		if ns.UI and ns.UI.Dirty then ns.UI.Dirty() end
 		if verbose then ns.Print(ns.T("Berufe eingelesen.", "Professions scanned.")) end
 	elseif verbose then
@@ -234,7 +247,7 @@ function Scan.Debug()
 		if ok and type(ids) == "table" and ids[1] then
 			local okr, info = pcall(C_TradeSkillUI.GetRecipeInfo, ids[1])
 			if okr and type(info) == "table" then
-				P("Rezept " .. ids[1] .. ": categoryID = " .. tostring(info.categoryID) .. " (" .. #ids .. " Rezepte)")
+				P("Rezept " .. ids[1] .. ": categoryID = " .. tostring(info.categoryID) .. ", relativeDifficulty = " .. tostring(info.relativeDifficulty) .. " (" .. #ids .. " Rezepte)")
 				if info.categoryID and C_TradeSkillUI.GetCategoryInfo then
 					local okc, ci = pcall(C_TradeSkillUI.GetCategoryInfo, info.categoryID)
 					if okc and type(ci) == "table" then

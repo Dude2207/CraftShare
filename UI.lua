@@ -18,7 +18,7 @@ local COL = {
 	secbg = { 0.098, 0.082, 0.063 }, black = { 0.059, 0.047, 0.035 }, tree = { 0.10, 0.082, 0.059 },
 	border = { 0.30, 0.247, 0.176 }, border2 = { 0.227, 0.184, 0.133 },
 	gold = { 0.95, 0.76, 0.19 }, goldDim = { 0.66, 0.54, 0.16 }, text = { 0.945, 0.92, 0.878 }, muted = { 0.604, 0.561, 0.494 },
-	orange = { 0.878, 0.443, 0.227 }, green = { 0.31, 0.816, 0.353 }, red = { 0.85, 0.33, 0.29 }, off = { 0.42, 0.353, 0.267 },
+	orange = { 0.878, 0.443, 0.227 }, yellow = { 0.95, 0.80, 0.20 }, gray = { 0.5, 0.5, 0.5 }, green = { 0.31, 0.816, 0.353 }, red = { 0.85, 0.33, 0.29 }, off = { 0.42, 0.353, 0.267 },
 	sel = { 0.29, 0.239, 0.071 }, btn = { 0.165, 0.129, 0.094 }, btnOn = { 0.231, 0.184, 0.106 }, cat = { 0.85, 0.70, 0.29 },
 }
 
@@ -123,6 +123,13 @@ local function Box(parent, bg, border, ftype)
 		setc(t, bg)
 	end
 	return f
+end
+
+-- Schwierigkeit 0 orange, 1 gelb, 2 gruen, 3 grau (nil: Vorgabe)
+local function diffColor(d, default)
+	if d == 0 then return COL.orange elseif d == 1 then return COL.yellow
+	elseif d == 2 then return COL.green elseif d == 3 then return COL.gray end
+	return default
 end
 
 local function setBorder(f, c)
@@ -366,9 +373,19 @@ local function buildItems()
 				cname, cidx = CAT_NAME[sk], 1000 + CAT_IDX[sk]
 			end
 			e.catName = cname
+			-- beste Schwierigkeit unter den Herstellern (0 orange .. 3 grau), nil = unbekannt
+			local bd
+			for _, m in ipairs(e.crafters) do
+				if not (u.onlineOnly and not m.online) then
+					local rr = m.prof.recipes and m.prof.recipes[e.id]
+					local d = rr and rr.d
+					if d and (not bd or d < bd) then bd = d end
+				end
+			end
+			e.diff = bd
 			local oid = e.rec.out
 			e.inter = (oid and oid > 0 and usedAsReagent[oid] and not EQUIP[itemStatic(oid)[1] or ""]) and true or false
-			if q == "" or recipeMatches(q, e, g.name) then
+			if (q == "" or recipeMatches(q, e, g.name)) and not (u.skillOnly and e.diff == 3) then
 				local list = byCat[cname]
 				if not list then
 					list = {}
@@ -394,7 +411,9 @@ local function buildItems()
 			end
 		end
 		if total > 0 then
-			out[#out + 1] = { t = "prof", key = key, name = g.name, n = total, members = g.members, collapsed = u.collapsed[key] }
+			local fullKeys = {}
+			for _, ck in ipairs(catKeys) do fullKeys[#fullKeys + 1] = key .. "/" .. ck end
+			out[#out + 1] = { t = "prof", key = key, name = g.name, n = total, members = g.members, collapsed = u.collapsed[key], cats = fullKeys }
 			if not u.collapsed[key] then
 				table.sort(catKeys, function(a, b)
 					if catOrder[a] ~= catOrder[b] then return catOrder[a] < catOrder[b] end
@@ -441,7 +460,8 @@ local function buildBottom()
 			if p and (u.tab == "all" or (p.recipes and p.recipes[S.selRec])) then
 				local online = ns.Roster.IsOnline(cname)
 				if not (u.onlineOnly and not online) then
-					list[#list + 1] = { name = cname, char = c, prof = p, online = online }
+					local rr = p.recipes and p.recipes[S.selRec]
+				list[#list + 1] = { name = cname, char = c, prof = p, online = online, d = rr and rr.d }
 				end
 			end
 		end
@@ -569,7 +589,7 @@ local function paintRow(row, it)
 	elseif it.t == "rec" then
 		local selected = (S.selKey == it.key and S.selRec == it.id)
 		setc(row.bg, selected and COL.sel or COL.row)
-		setc(row.bar, selected and COL.gold or COL.orange)
+		setc(row.bar, diffColor(it.diff, COL.orange))
 		row.ricon:SetTexture(ns.ItemIcon(it.rec.out))
 		row.recName:SetText(it.name)
 		local inter = it.inter
@@ -615,7 +635,7 @@ local function paintMRow(row, it)
 	if not it then row:Hide() return end
 	row:Show()
 	setc(row.bg, COL.row)
-	setc(row.bar, it.online and COL.orange or COL.off)
+	setc(row.bar, diffColor(it.d, it.online and COL.orange or COL.off))
 	row:SetAlpha(it.online and 1 or 0.65)
 	local class = it.char.class
 	local coords = class and CLASS_ICON_TCOORDS and CLASS_ICON_TCOORDS[class]
@@ -784,7 +804,8 @@ local function renderStatus()
 	W.scrapChk:SetShown(leather)
 	W.scrapTxt:SetShown(leather)
 	W.scrapChk:SetChecked(P.Settings().scraps and true or false)
-	W.opts:SetHeight(leather and 340 or 290)
+	W.opts:SetHeight(leather and 372 or 322)
+	if W.skillChk then W.skillChk:SetChecked(cfg().skillOnly and true or false) end
 	if W.scaleVal then W.scaleVal:SetText(math.floor(UI.UserScale() * 100 + 0.5) .. "%") end
 	-- Hinweis auf neue Auftraege direkt am Knopf
 	local open = ns.Orders and ns.Orders.IncomingOpen() or 0
@@ -824,7 +845,17 @@ local function onRowClick(row, btn)
 	local it = row.item
 	if not it then return end
 	local u = cfg()
-	if it.t == "prof" then
+	if btn == "RightButton" then
+		-- Rechtsklick auf den Beruf: alle Kategorien ein- bzw. ausklappen
+		if it.t ~= "prof" then return end
+		local anyOpen = false
+		for _, ck in ipairs(it.cats or {}) do
+			if not u.catCollapsed[ck] then anyOpen = true break end
+		end
+		for _, ck in ipairs(it.cats or {}) do u.catCollapsed[ck] = anyOpen or nil end
+		u.collapsed[it.key] = nil
+		offset = 0
+	elseif it.t == "prof" then
 		u.collapsed[it.key] = not u.collapsed[it.key] or nil
 	elseif it.t == "cat" then
 		u.catCollapsed[it.ck] = not u.catCollapsed[it.ck] or nil
@@ -886,7 +917,7 @@ local function buildRow(parent, i)
 	local row = CreateFrame("Button", nil, parent)
 	row:SetSize(ROW_W, ROW_H)
 	row:SetPoint("TOPLEFT", 6, -24 - (i - 1) * ROW_H)
-	row:RegisterForClicks("LeftButtonUp")
+	row:RegisterForClicks("LeftButtonUp", "RightButtonUp")
 	row.bg = row:CreateTexture(nil, "BACKGROUND")
 	row.bg:SetPoint("TOPLEFT", 0, -1)
 	row.bg:SetPoint("BOTTOMRIGHT", 0, 1)
@@ -1136,7 +1167,7 @@ local function build()
 	end)
 	optBtn:SetPoint("TOPRIGHT", -38, -6)
 	W.opts = Box(f, COL.bg, COL.border)
-	W.opts:SetSize(340, 340)
+	W.opts:SetSize(340, 372)
 	W.opts:SetPoint("TOPRIGHT", optBtn, "BOTTOMRIGHT", 0, -2)
 	W.opts:SetFrameStrata("DIALOG")
 	-- Klicks und Mausrad nicht an die Fenster darunter durchlassen
@@ -1169,9 +1200,20 @@ local function build()
 	W.scaleVal:SetPoint("RIGHT", plusB, "LEFT", -4, 0)
 	local minusB = Btn(W.opts, "-", 22, 22, function() UI.SetUserScale(UI.UserScale() - 0.05) end)
 	minusB:SetPoint("RIGHT", W.scaleVal, "LEFT", -4, 0)
-	optHead(T("Preise", "Prices"), -88)
+	W.skillChk = CreateFrame("CheckButton", nil, W.opts, "UICheckButtonTemplate")
+	W.skillChk:SetSize(22, 22)
+	W.skillChk:SetPoint("TOPLEFT", 10, -84)
+	W.skillChk:SetScript("OnClick", function(self)
+		cfg().skillOnly = self:GetChecked() and true or false
+		offset = 0
+		UI.Refresh()
+	end)
+	local skt = FS(W.opts, 11, COL.text)
+	skt:SetPoint("LEFT", W.skillChk, "RIGHT", 2, 0)
+	skt:SetText(T("Nur Rezepte mit Skillpunkten", "Only recipes that give skill points"))
+	optHead(T("Preise", "Prices"), -116)
 	W.srcBtn = Btn(W.opts, "", 316, 22, function() ns.Prices.CycleSource(); priceChanged() end)
-	W.srcBtn:SetPoint("TOPLEFT", 12, -104)
+	W.srcBtn:SetPoint("TOPLEFT", 12, -132)
 	W.ptBtn = Btn(W.opts, "", 316, 22, function()
 		local ps = ns.Prices.Settings()
 		ps.ptype = (ps.ptype == "market") and "min" or "market"
@@ -1193,21 +1235,21 @@ local function build()
 		c.key = key
 		W.chks[#W.chks + 1] = c
 	end
-	Chk("vendor", T("Händlerpreise einbeziehen (günstigster gewinnt)", "Include vendor prices (cheapest wins)"), -158)
-	Chk("chain", T("Herstellungskette prüfen (Fetzen, Leder, …)", "Check crafting chain (scraps, leather, …)"), -182)
-	Chk("free", T("Vorhandene Materialien kostenlos rechnen", "Count owned materials as free"), -206)
+	Chk("vendor", T("Händlerpreise einbeziehen (günstigster gewinnt)", "Include vendor prices (cheapest wins)"), -186)
+	Chk("chain", T("Herstellungskette prüfen (Fetzen, Leder, …)", "Check crafting chain (scraps, leather, …)"), -210)
+	Chk("free", T("Vorhandene Materialien kostenlos rechnen", "Count owned materials as free"), -234)
 	W.scanTxt = FS(W.opts, 11, COL.muted)
-	W.scanTxt:SetPoint("TOPLEFT", 12, -240)
+	W.scanTxt:SetPoint("TOPLEFT", 12, -268)
 	W.scanTxt:SetWidth(316)
 	W.scanBtn = Btn(W.opts, T("AH scannen", "Scan AH"), 150, 22, function() ns.Prices.StartScan(); UI.Refresh() end)
-	W.scanBtn:SetPoint("TOPLEFT", 12, -262)
+	W.scanBtn:SetPoint("TOPLEFT", 12, -290)
 	-- Lederverarbeitung (nur sichtbar, wenn eine eigene Figur den Beruf hat)
 	W.leatherHead = FS(W.opts, 10, COL.goldDim)
-	W.leatherHead:SetPoint("TOPLEFT", 12, -296)
+	W.leatherHead:SetPoint("TOPLEFT", 12, -324)
 	W.leatherHead:SetText(T("LEDERVERARBEITUNG", "LEATHERWORKING"))
 	W.scrapChk = CreateFrame("CheckButton", nil, W.opts, "UICheckButtonTemplate")
 	W.scrapChk:SetSize(22, 22)
-	W.scrapChk:SetPoint("TOPLEFT", 10, -310)
+	W.scrapChk:SetPoint("TOPLEFT", 10, -338)
 	W.scrapChk:SetScript("OnClick", function(self)
 		ns.Prices.Settings().scraps = self:GetChecked() and true or false
 		priceChanged()
@@ -1264,10 +1306,29 @@ local function build()
 	local ahl = W.allBtn:CreateTexture(nil, "HIGHLIGHT")
 	ahl:SetAllPoints()
 	ahl:SetColorTexture(1, 1, 1, 0.1)
-	W.allBtn:SetScript("OnClick", function() cfg().hidden = {}; UI.Refresh() end)
+	local function allShown()
+		local u = cfg()
+		for _, b in ipairs(iconBtns) do
+			if b:IsShown() and u.hidden[b.key] then return false end
+		end
+		return true
+	end
+	W.allBtn:SetScript("OnClick", function()
+		local u = cfg()
+		if allShown() then
+			for _, b in ipairs(iconBtns) do
+				if b:IsShown() then u.hidden[b.key] = true end
+			end
+			S.selKey, S.selRec = nil, nil
+		else
+			u.hidden = {}
+		end
+		offset, boffset = 0, 0
+		UI.Refresh()
+	end)
 	W.allBtn:SetScript("OnEnter", function(self)
 		GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
-		GameTooltip:AddLine(T("Alle Berufe anzeigen", "Show all professions"), 1, 1, 1)
+		GameTooltip:AddLine(allShown() and T("Alle Berufe ausblenden", "Hide all professions") or T("Alle Berufe anzeigen", "Show all professions"), 1, 1, 1)
 		GameTooltip:Show()
 	end)
 	W.allBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)

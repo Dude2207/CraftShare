@@ -51,6 +51,8 @@ local function encodeRecipe(id, rec)
 	if rec.q and rec.q > 1 then out = out .. "x" .. rec.q end
 	-- Kategorie (Nummer in der Kategorieliste des Berufs, Nachricht K)
 	if rec.c then out = out .. "@" .. rec.c end
+	-- Schwierigkeit (0 orange, 1 gelb, 2 gruen, 3 grau)
+	if rec.d then out = out .. "~" .. rec.d end
 	return id .. "," .. out .. "," .. table.concat(parts, "/")
 end
 
@@ -149,12 +151,13 @@ local function onMessage(text, channel, sender)
 		local prof = ch and ch.profs[a]
 		if not prof or not b then return end
 		for entry in b:gmatch("[^;]+") do
-			local id, out, qty, cat, reag = entry:match("^(%d+),(%d+)x?(%d*)@?(%d*),?(.*)$")
-			id, out, qty, cat = tonumber(id), tonumber(out), tonumber(qty), tonumber(cat)
+			local id, out, qty, cat, dif, reag = entry:match("^(%d+),(%d+)x?(%d*)@?(%d*)~?(%d*),?(.*)$")
+			id, out, qty, cat, dif = tonumber(id), tonumber(out), tonumber(qty), tonumber(cat), tonumber(dif)
 			if id and prof.count < 1500 then
 				local rec = { out = out or 0, r = {} }
 				if cat and cat >= 1 and cat <= 60 then rec.c = cat end
 				if qty and qty > 1 and qty < 1000 then rec.q = qty end
+				if dif and dif >= 0 and dif <= 3 then rec.d = dif end
 				for item, qty in (reag or ""):gmatch("(%d+):(%d+)") do
 					rec.r[#rec.r + 1] = { tonumber(item), tonumber(qty) }
 				end
