@@ -31,6 +31,17 @@ local function classicCategories()
 	return map, order, diffs
 end
 
+-- Schwierigkeit aus den Rezeptdaten lesen: 0 orange, 1 gelb, 2 gruen, 3 grau (nil = unbekannt)
+local DIFF_WORDS = { optimal = 0, orange = 0, medium = 1, yellow = 1, easy = 2, green = 2, trivial = 3, gray = 3, grey = 3 }
+local function diffOf(info)
+	for _, k in ipairs({ "relativeDifficulty", "difficulty", "skillType", "skillUpType" }) do
+		local v = info[k]
+		if type(v) == "number" and v >= 0 and v <= 3 then return math.floor(v) end
+		if type(v) == "string" and DIFF_WORDS[v:lower()] then return DIFF_WORDS[v:lower()] end
+	end
+	return nil
+end
+
 local function scanOpenProfession()
 	if not (C_TradeSkillUI and C_TradeSkillUI.GetAllRecipeIDs and C_TradeSkillUI.GetRecipeInfo) then return false end
 	local base
@@ -86,7 +97,7 @@ local function scanOpenProfession()
 				end
 			end
 			-- Schwierigkeit fuer diese Figur: 0 orange, 1 gelb, 2 gruen, 3 grau
-			local d = tonumber(info.relativeDifficulty)
+			local d = diffOf(info)
 			if d == nil and classicDiff then d = classicDiff[id] end
 			if d and d >= 0 and d <= 3 then rec.d = math.floor(d) end
 			sig = sig + (id % 9973) * ((rec.d or 4) + 1)
@@ -247,7 +258,9 @@ function Scan.Debug()
 		if ok and type(ids) == "table" and ids[1] then
 			local okr, info = pcall(C_TradeSkillUI.GetRecipeInfo, ids[1])
 			if okr and type(info) == "table" then
-				P("Rezept " .. ids[1] .. ": categoryID = " .. tostring(info.categoryID) .. ", relativeDifficulty = " .. tostring(info.relativeDifficulty) .. " (" .. #ids .. " Rezepte)")
+				P("Rezept " .. ids[1] .. ": categoryID = " .. tostring(info.categoryID) .. " (" .. #ids .. " Rezepte)")
+				for k, v in pairs(info) do P("  info." .. tostring(k) .. " = " .. tostring(v)) end
+				P("  erkannte Schwierigkeit = " .. tostring(diffOf(info)))
 				if info.categoryID and C_TradeSkillUI.GetCategoryInfo then
 					local okc, ci = pcall(C_TradeSkillUI.GetCategoryInfo, info.categoryID)
 					if okc and type(ci) == "table" then
