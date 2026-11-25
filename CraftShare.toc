@@ -1,0 +1,19 @@
+## Interface: 16001
+## Title: CraftShare
+## Title-deDE: CraftShare - Gildenberufe
+## Notes: Shared overview of who has which profession and who can craft what, with the required materials. Syncs automatically with guild, group and friends. /cs
+## Notes-deDE: Gemeinsame Übersicht: Wer hat welchen Beruf, wer kann was herstellen und welche Materialien werden benötigt. Synchronisiert automatisch mit Gilde, Gruppe und Freunden. /cs
+## Version: 0.1.0
+## IconTexture: Interface\AddOns\CraftShare\Media\Icon
+## SavedVariables: CraftShareDB
+## OptionalDeps: ChatThrottleLib
+
+Core.lua
+Scan.lua
+Comm.lua
+Roster.lua
+Prices.lua
+PriceCheck.lua
+UI.lua
+Orders.lua
+MiniButton.lua

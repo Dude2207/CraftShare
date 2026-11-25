@@ -1,0 +1,5 @@
+<Bindings>
+	<Binding name="CRAFTSHARE_TOGGLE" header="CRAFTSHARE" category="ADDONS">
+		CraftShare_Toggle()
+	</Binding>
+</Bindings>
