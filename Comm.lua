@@ -132,6 +132,8 @@ local function onMessage(text, channel, sender)
 	local kind, a, b, c, d, e = strsplit("|", text)
 	if kind == "P" or kind == "L" then ns.lastSync = time() end
 	if kind == "Q" then
+		-- der Anfragende ist gerade online gekommen: Auftragsstand nachreichen
+		if ns.Orders and ns.Orders.Resync then C_Timer.After(2, function() ns.Orders.Resync(name) end) end
 		-- Antwort gestaffelt und nur einmal pro Minute je Anfragendem, per Fluestern
 		local now = GetTime()
 		if replied[name] and now - replied[name] < 60 then return end

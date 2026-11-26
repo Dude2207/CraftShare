@@ -1,6 +1,6 @@
 -- CraftShare: Kern (Namespace, Datenbank, Hilfsfunktionen, Slash-Befehle)
 local ADDON, ns = ...
-ns.VERSION = "0.1.0"
+ns.VERSION = "0.3.0"
 ns.PREFIX = "CraftShare"
 
 local L = {}
@@ -167,6 +167,13 @@ function ns.ItemName(itemID)
 	return name
 end
 
+-- Bestand eines Gegenstands (Taschen, mit bank=true auch Bank). Neuere Clients kennen nur C_Item.GetItemCount.
+function ns.ItemCount(itemID, bank)
+	local get = (C_Item and C_Item.GetItemCount) or GetItemCount
+	if not get or not itemID then return 0 end
+	return get(itemID, bank and true or false) or 0
+end
+
 function ns.ItemIcon(itemID)
 	if not itemID then return nil end
 	if C_Item and C_Item.GetItemIconByID then
@@ -238,6 +245,8 @@ SlashCmdList["CRAFTSHARE"] = function(msg)
 		ns.Comm.Request()
 		ns.Comm.SendOwn()
 		ns.Print(T("Synchronisation angefordert.", "Sync requested."))
+	elseif cmd == "post" then
+		ns.Mail.Debug()
 	elseif cmd == "ah" then
 		ns.Prices.Debug()
 	elseif cmd == "debug" then

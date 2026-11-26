@@ -67,7 +67,7 @@ local function build()
 		if u and u.how == "make" then
 			local crafts = math.ceil(need / (u.prod.q or 1))
 			for _, r in ipairs(u.prod.r) do
-				local rneed = r[2] * crafts - (GetItemCount and GetItemCount(r[1], true) or 0)
+				local rneed = r[2] * crafts - ns.ItemCount(r[1], true)
 				if rneed > 0 then collect(r[1], P.Unit(r[1], 1), rneed) end
 			end
 		else
@@ -94,7 +94,7 @@ local function build()
 
 	for _, d in ipairs(rec.r) do
 		local id, q = d[1], d[2] * qty
-		local have = GetItemCount and GetItemCount(id, true) or 0
+		local have = ns.ItemCount(id, true)
 		local u = P.Unit(id)
 		local hc = have >= q and "|cff4fd05a" or (have > 0 and "|cffe8a96a" or "|cffd9544a")
 		local pay = free and math.max(0, q - have) or q

@@ -280,7 +280,7 @@ function P.RecipeCost(rec)
 	local total, unk, lines = 0, 0, {}
 	for i, r in ipairs(rec.r) do
 		local id, q = r[1], r[2]
-		local have = GetItemCount and GetItemCount(id, true) or 0
+		local have = ns.ItemCount(id, true)
 		local pay = free and math.max(0, q - have) or q
 		local u = P.Unit(id)
 		local ln = { id = id, q = q, have = have, u = u }

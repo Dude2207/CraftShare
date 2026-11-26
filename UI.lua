@@ -308,7 +308,7 @@ end
 local function treeLines(e)
 	local out = { { t = "tl", head = true } }
 	for _, d in ipairs(e.rec.r) do
-		local have = GetItemCount and GetItemCount(d[1], true) or 0
+		local have = ns.ItemCount(d[1], true)
 		local hc = have >= d[2] and "|cff4fd05a" or (have > 0 and "|cffe8a96a" or "|cffd9544a")
 		local acc, order = {}, {}
 		expand(d[1], d[2], acc, order, 0)
@@ -540,7 +540,7 @@ function UI.ApplyScale()
 			frame:SetResizeBounds(MIN_W, MIN_H, math.floor(UIParent:GetWidth() / es), math.floor(UIParent:GetHeight() / es))
 		end
 	end
-	for _, n in ipairs({ "CraftSharePriceCheck", "CraftShareOrderFrame", "CraftShareOrdersFrame" }) do
+	for _, n in ipairs({ "CraftSharePriceCheck", "CraftShareOrderFrame", "CraftShareOrdersFrame", "CraftShareTaskFrame", "CraftShareMailFrame" }) do
 		local g = _G[n]
 		if g then g:SetScale(us) end
 	end
