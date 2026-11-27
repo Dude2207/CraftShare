@@ -15,7 +15,7 @@ jobs:
       - name: Build zip
         run: |
           mkdir -p build/CraftShare
-          rsync -a --exclude '.git' --exclude '.github' --exclude '.gitignore' --exclude 'build' ./ build/CraftShare/
+          rsync -a --exclude '.git' --exclude '.github' --exclude '.gitignore' --exclude '.pkgmeta' --exclude 'build' ./ build/CraftShare/
           cd build && zip -r "../CraftShare-${GITHUB_REF_NAME}.zip" CraftShare
       - name: Publish release
         env:
