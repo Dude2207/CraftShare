@@ -8,6 +8,12 @@ local pending = false
 
 function R.Update()
 	pending = false
+	-- wer war bisher offline? (beim ersten Einlesen nichts vergleichen)
+	local before
+	if next(info) then
+		before = {}
+		for name, e in pairs(info) do before[name] = e.online end
+	end
 	wipe(info)
 	if not (IsInGuild and IsInGuild()) then return end
 	local n = GetNumGuildMembers and GetNumGuildMembers() or 0
@@ -20,6 +26,17 @@ function R.Update()
 				if ok2 then e.last = ((y or 0) * 365 + (m or 0) * 30 + (d or 0)) * 86400 + (h or 0) * 3600 end
 			end
 			info[ns.ShortName(name)] = e
+		end
+	end
+	-- gerade online gekommen: verpasste Auftraege und Auftragsstand nachreichen
+	if before and ns.Orders and ns.Orders.Resync then
+		for name, e in pairs(info) do
+			if e.online and before[name] == false and name ~= ns.Me() then
+				C_Timer.After(5, function()
+					ns.Orders.Resync(name)
+					if ns.Relay then ns.Relay.Deliver(name) end
+				end)
+			end
 		end
 	end
 	-- Voller Name (mit Nachname) des eigenen Charakters: genau ein Gildenmitglied "Vorname Nachname"

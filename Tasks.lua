@@ -11,10 +11,11 @@ local STEP_W = WIDTH - 20
 local BODY_X = 32
 local BODY_W = STEP_W - BODY_X - 10
 local MAXLINES, LINE_H = 14, 17
-local MAXBTNS = 5
+local MAXBTNS = 6
 
 local win
 local curId
+local folded = false -- bis auf die Kopfzeile eingeklappt (bis zum Schliessen)
 
 -- welcher Auftrag ist je Figur offen, und wo steht das Fenster
 local function ui()
@@ -52,10 +53,19 @@ local function partnerName(o)
 	return o.from
 end
 
+-- Taschen und Bank (die Bank kennt das Spiel erst, nachdem man sie einmal geoeffnet hat)
+local function owned(id) return ns.ItemCount(id, true) end
+
 local function haveText(id, need)
 	local have = bags(id)
 	if have >= need then return green(have .. T(" in Taschen", " in bags")) end
-	return red(have .. T(" in Taschen, ", " in bags, ") .. (need - have) .. T(" fehlen", " missing"))
+	local total = math.max(have, owned(id))
+	local bank = total - have
+	local text = have .. T(" in Taschen", " in bags")
+	if bank > 0 then text = text .. ", " .. bank .. T(" Bank", " bank") end
+	-- genug da, aber noch von der Bank zu holen
+	if total >= need then return "|cffe8a96a" .. text .. "|r" end
+	return red(text .. ", " .. (need - total) .. T(" fehlen", " missing"))
 end
 
 -- ---------------------------------------------------------------- Inhalt der Schritte
@@ -64,98 +74,44 @@ local function set(o, field, value)
 	O.Push(o)
 end
 
-local function undo(fn) return { text = T("Rückgängig", "Undo"), fn = fn } end
+local function undo(fn) return { text = T("Rückgängig", "Undo"), fn = fn, right = true } end
 
--- Bezahlung im Voraus: Trinkgeld und ggf. Materialkosten per Post
-local function stepPayment(o, ag)
-	local partner = partnerName(o)
-	local due, known = O.Due(o)
-	local paid, refund = o.paid or 0, O.Refund(o)
-	local s = { title = ag and T("Geld an ", "Send money to ") .. partner .. T(" schicken", "")
-		or T("Geld von ", "Money from ") .. o.from, lines = {}, buttons = {} }
-	local function line(left, right) s.lines[#s.lines + 1] = { left, right } end
-	if (o.tip or 0) > 0 then
-		line(T("Trinkgeld", "Tip"), o.waive and green(T("erlassen", "waived")) or money(o.tip))
+-- Materialkosten (Hersteller besorgt das Material): Zeilen, Betragsfelder und Haekchen im Versandschritt.
+-- Bezahlt wird per Nachnahme, die im Spiel derzeit abgeschaltet ist.
+local function addCosts(s, o, ag)
+	if o.mats ~= "crafter" then return end
+	local cost, known = O.CodAmount(o)
+	local label = O.COD_ENABLED and T("Nachnahme (Material)", "Cash on delivery (materials)")
+		or T("Materialkosten", "Material costs")
+	s.lines[#s.lines + 1] = { label, not known and muted(T("legt der Hersteller fest", "set by the crafter"))
+		or (cost == 0 and green(T("keine", "none"))) or money(cost) }
+	if not O.COD_ENABLED and (not known or cost > 0) then
+		s.hint = (s.hint and (s.hint .. " ") or "") .. muted(T("Nachnahme ist derzeit deaktiviert, bitte selbst abrechnen.",
+			"Cash on delivery is currently disabled, please settle it yourselves."))
 	end
-	if o.mats == "crafter" then
-		local cost = due - (o.waive and 0 or (o.tip or 0))
-		line(T("Materialkosten", "Material costs"), not known and muted(T("legt der Hersteller fest", "set by the crafter"))
-			or (cost == 0 and green(T("keine", "none"))) or money(cost))
-	end
-	if paid > 0 then line(T("Geschickt", "Sent"), money(paid)) end
-	if o.ret then line(T("Zurückgeschickt", "Sent back"), money(o.ret)) end
-
-	if ag then
-		local owed = O.Owed(o)
-		if not known then
-			s.state, s.chip = "wait", T("wartet auf Materialkosten", "waiting for costs")
-		elseif owed > 0 then
-			s.state, s.chip = "act", T("deine Aufgabe", "your task")
-			line(T("Noch zu schicken", "Still to send"), money(owed))
-			s.hint = T("Geh zum Briefkasten, die Post wird vorbereitet (mit dem Material zusammen, falls noch offen).",
-				"Go to a mailbox and the mail is prepared (together with the materials if still open).")
-			s.buttons[1] = { text = T("Von Hand abhaken", "Tick off manually"), fn = function() set(o, "paid", paid + owed) end }
-		elseif paid > 0 and not o.mg then
-			s.state, s.chip = "wait", T("unterwegs zu ", "on the way to ") .. partner
-			s.buttons[1] = undo(function() set(o, "paid", nil) end)
-		else
-			s.state, s.chip = "done", paid > 0 and T("erledigt", "done") or T("nichts zu zahlen", "nothing to pay")
-		end
-		if refund > 0 then s.hint = green(partner .. T(" schickt dir " , " sends you back ") .. money(refund) .. T(" zurück.", ".")) end
-		return s
-	end
-
-	if refund > 0 then
-		s.state, s.chip = "act", T("zurückschicken", "send back")
-		line(T("Zurückzuschicken", "To send back"), money(refund))
-		s.hint = T("Wird am Briefkasten beigelegt bzw. als Rückgabe vorbereitet.",
-			"Attached at the mailbox, or prepared as a return.")
-		s.buttons[1] = { text = T("Von Hand abhaken", "Tick off manually"), fn = function() set(o, "ret", (o.ret or 0) + refund) end }
-	elseif paid > 0 and not o.mg then
-		s.state, s.chip = "act", T("Post abholen", "check your mail")
-		s.buttons[1] = { text = T("Geld erhalten", "Money received"), main = true, fn = function() set(o, "mg", true) end }
-	elseif paid > 0 then
-		s.state, s.chip = "done", T("erhalten", "received")
-		s.buttons[1] = undo(function() o.moneyTaken = nil; set(o, "mg", nil) end)
-	elseif known and due == 0 then
-		s.state, s.chip = "done", T("nichts zu zahlen", "nothing to pay")
-	else
-		s.state, s.chip = "wait", T("wartet auf ", "waiting for ") .. o.from
-	end
-	-- "Material vorhanden": keine Kosten (bis zum Versand waehlbar, bereits Gezahltes wird zurueckgeschickt)
+	if ag or o.sh then return end
 	local free = o.mcSet and o.mc == 0
-	if o.mats == "crafter" and not o.sh then
-		s.checks = { { text = T("Material vorhanden, keine Materialkosten", "I have the materials, no material costs"),
-			checked = free and true or false, fn = function(v)
-				if v then
-					o.mcPrev, o.mcPrevSet = o.mc, o.mcSet
-					o.mc, o.mcSet = 0, true
-				else
-					-- nach der Zahlung den alten Betrag zurueckholen, sonst neu aus den Preisdaten
-					o.mc = o.mcPrev or O.SuggestMatCost(o)
-					o.mcSet = o.paid and true or o.mcPrevSet
-					if not o.paid and o.mc == 0 then o.mc, o.mcSet = O.SuggestMatCost(o), nil end
-				end
-				for _, f in ipairs(win.steps) do
-					for i = 1, 3 do f.coins[i].edit:ClearFocus() end
-				end
-				O.Push(o)
-			end } }
-	end
-	if o.mats == "crafter" and not o.paid and not o.sh and not free then
+	s.checks = { { text = T("Material vorhanden, keine Materialkosten", "I have the materials, no material costs"),
+		checked = free and true or false, fn = function(v)
+			if v then
+				o.mcPrev, o.mcPrevSet = o.mc, o.mcSet
+				o.mc, o.mcSet = 0, true
+			else
+				o.mc, o.mcSet = o.mcPrev, o.mcPrevSet
+				if not o.mc or o.mc == 0 then o.mc, o.mcSet = O.SuggestMatCost(o), nil end
+			end
+			for _, f in ipairs(win.steps) do
+				for i = 1, 3 do f.coins[i].edit:ClearFocus() end
+			end
+			O.Push(o)
+		end } }
+	if not free then
 		local suggested, unknown = O.SuggestMatCost(o)
 		s.coins = (o.mcSet and o.mc) or suggested
-		s.hint = T("Materialkosten (Vorschlag aus den Preisdaten, änderbar):", "Material costs (suggested from price data, editable):")
 		if unknown > 0 and not o.mcSet then
-			s.hint = s.hint .. " " .. red(unknown .. T(" Zutat(en) ohne Preis", " ingredient(s) without a price"))
+			s.hint = (s.hint and (s.hint .. " ") or "") .. red(unknown .. T(" Zutat(en) ohne Preis.", " ingredient(s) without a price."))
 		end
 	end
-	if (o.tip or 0) > 0 and not o.sh then
-		s.checks = s.checks or {}
-		s.checks[#s.checks + 1] = { text = T("Trinkgeld erlassen (Geld wird zurückgeschickt)", "Waive the tip (money is sent back)"),
-			checked = o.waive and true or false, fn = function(v) set(o, "waive", v or nil) end }
-	end
-	return s
 end
 
 local function stepMaterials(o, ag)
@@ -180,21 +136,53 @@ local function stepMaterials(o, ag)
 		else right = muted(T("offen", "open")) end
 		s.lines[i] = { K.itemText(e[1], e[2]), right, e[1] }
 	end
-	if ag and not o.ms and O.Owed(o) > 0 then
-		s.lines[#s.lines + 1] = { T("Geld beilegen", "Money to attach"), money(O.Owed(o)) }
-	end
 	if ag then
 		if o.ms then
 			s.state, s.chip = "wait", T("unterwegs zu ", "on the way to ") .. partnerName(o)
-			s.buttons[1] = undo(function() o.plan, o.sentM = nil, nil; set(o, "ms", nil) end)
+			s.buttons[1] = undo(function() o.plan, o.sentM, o.msAt = nil, nil, nil; set(o, "ms", nil) end)
 		else
 			s.state, s.chip = "act", T("deine Aufgabe", "your task")
 			s.hint = T("Geh zum Briefkasten, die Post wird vorbereitet. Bei Übergabe per Handel hier abhaken.",
 				"Go to a mailbox and the mail is prepared. If you trade it, tick it off here.")
-			s.buttons[1] = { text = T("Von Hand abhaken", "Tick off manually"), fn = function() set(o, "ms", true) end }
+			if o.hold then
+				s.hint = s.hint .. " " .. red(T("Der Auftrag wird erst danach an ", "The order is only sent to ") .. partnerName(o) ..
+					T(" gesendet.", " after that."))
+			end
+			s.buttons[1] = { tick = true, tip = T("Von Hand abhaken", "Tick off manually"), fn = function() set(o, "ms", true) end }
+			-- was noch fehlt, als Einkaufsliste an Auctionator geben
+			local need = {}
+			for _, e in ipairs(list) do
+				local missing = e[2] - (sent[e[1]] or 0) - owned(e[1])
+				if missing > 0 then need[#need + 1] = { id = e[1], n = missing } end
+			end
+			-- am Bankschalter: das Fehlende aus der Bank in die Taschen holen
+			local fetch = {}
+			for _, e in ipairs(list) do
+				local want = e[2] - (sent[e[1]] or 0) - bags(e[1])
+				local inBank = owned(e[1]) - bags(e[1])
+				if want > 0 and inBank > 0 then fetch[#fetch + 1] = { id = e[1], n = math.min(want, inBank) } end
+			end
+			if #need > 0 and ns.PriceCheck and ns.PriceCheck.HasAuctionator() then
+				s.buttons[2] = { text = T("Einkaufsliste an Auctionator", "Shopping list to Auctionator"), fn = function()
+					ns.PriceCheck.CreateList(o.qty .. "x " .. O.Name(o) .. " #" .. ns.Mail.Code(o.id), need)
+				end }
+			end
+			if #fetch > 0 and ns.Mail and ns.Mail.bankOpen then
+				s.buttons[#s.buttons + 1] = { text = T("Aus Bank holen", "Fetch from bank"), main = true,
+					fn = function() ns.Mail.FetchFromBank(fetch) end }
+			end
 		end
 	else
-		if o.ms then
+		-- per Post verschickt: Zeitpunkt, und Restzeit solange sie noch unterwegs ist
+		local left = O.MatTransit(o)
+		if o.ms and o.msAt then
+			s.hint = o.from .. T(" hat die Rohstoffe um ", " sent the materials at ") .. date("%H:%M", o.msAt) .. T(" Uhr verschickt. ", ". ")
+			s.hint = s.hint .. (left > 0 and (T("Ankunft in höchstens ", "Arrives within ") .. O.Clock(left) .. T(" Minuten.", " minutes."))
+				or green(T("Die Post sollte da sein.", "The mail should have arrived.")))
+		end
+		if left > 0 then
+			s.state, s.chip = "wait", T("unterwegs ", "on the way ") .. O.Clock(left)
+		elseif o.ms then
 			s.state, s.chip = "act", T("Post abholen", "check your mail")
 		else
 			s.state, s.chip = "wait", T("wartet auf ", "waiting for ") .. o.from
@@ -264,6 +252,19 @@ local function stepCraft(o, ag)
 	s.buttons[2] = { text = T("Beruf öffnen", "Open profession"), fn = function() Task.OpenProfession(o.key) end }
 	s.buttons[3] = { text = T("1× abhaken", "Tick off 1×"), fn = function() set(o, "cr", cr + 1) end }
 	if cr > 0 then s.buttons[4] = undo(function() set(o, "cr", cr - 1) end) end
+	-- am Bankschalter: fehlende Zutaten in die Taschen holen
+	if ns.Mail and ns.Mail.bankOpen then
+		local fetch = {}
+		for _, e in ipairs(o.r) do
+			local want = e[2] * rest - bags(e[1])
+			local inBank = owned(e[1]) - bags(e[1])
+			if want > 0 and inBank > 0 then fetch[#fetch + 1] = { id = e[1], n = math.min(want, inBank) } end
+		end
+		if #fetch > 0 then
+			s.buttons[#s.buttons + 1] = { text = T("Aus Bank holen", "Fetch from bank"), main = true,
+				fn = function() ns.Mail.FetchFromBank(fetch) end }
+		end
+	end
 	-- fehlt ein Zwischenprodukt, das ich selbst herstellen kann: zuerst dieses
 	for _, e in ipairs(o.r) do
 		local missing = e[2] * rest - bags(e[1])
@@ -292,15 +293,17 @@ local function stepShip(o, ag)
 	end
 	if o.sh then
 		s.state, s.chip = "done", enchant and T("übergeben", "handed over") or T("verschickt", "sent")
-		if not ag then s.buttons[1] = undo(function() o.sentW = nil; set(o, "sh", nil) end) end
+		if not ag then s.buttons[1] = undo(function() o.sentW, o.shAt = nil, nil; set(o, "sh", nil) end) end
 		return s
 	end
 	if (o.cr or 0) < o.qty then
 		s.state, s.chip = "idle", T("noch nicht dran", "not yet")
+		addCosts(s, o, ag)
 		return s
 	end
 	if ag then
 		s.state, s.chip = "wait", T("wartet auf Versand", "waiting for shipping")
+		addCosts(s, o, ag)
 		return s
 	end
 	s.state, s.chip = "act", T("deine Aufgabe", "your task")
@@ -311,13 +314,8 @@ local function stepShip(o, ag)
 		s.lines[1] = { K.itemText(o.out, total), haveText(o.out, rest) .. (done > 0 and muted(" (" .. done .. T(" verschickt", " sent") .. ")") or ""), o.out }
 		s.hint = T("Geh zum Briefkasten, die Post wird vorbereitet.", "Go to a mailbox and the mail is prepared.")
 	end
-	local refund = O.Refund(o)
-	if refund > 0 and not enchant then s.lines[#s.lines + 1] = { T("Beilage (Rückgabe)", "Attach (return)"), money(refund) } end
-	local warn
-	if O.Due(o) > (o.paid or 0) then warn = T("Noch nicht vollständig bezahlt.", "Not fully paid yet.")
-	elseif o.paid and not o.mg then warn = T("Das Geld ist noch nicht abgeholt.", "The money is not collected yet.") end
-	if warn then s.hint = (s.hint and (s.hint .. " ") or "") .. red(warn) end
-	s.buttons[1] = { text = enchant and T("Als übergeben abhaken", "Mark as handed over") or T("Von Hand abhaken", "Tick off manually"), main = enchant,
+	addCosts(s, o, ag)
+	s.buttons[1] = { tick = true, tip = enchant and T("Als übergeben abhaken", "Mark as handed over") or T("Von Hand abhaken", "Tick off manually"), main = enchant,
 		fn = function() set(o, "sh", true) end }
 	return s
 end
@@ -333,12 +331,21 @@ local function stepReceive(o, ag)
 	if ag then
 		s.state, s.chip = "act", (o.out and o.out > 0) and T("Post abholen", "check your mail") or T("deine Aufgabe", "your task")
 		if o.out and o.out > 0 then s.lines[1] = { K.itemText(o.out, o.qty * (o.outq or 1)), muted(T("unterwegs", "on the way")), o.out } end
-		if o.ret then s.lines[#s.lines + 1] = { T("Geld zurück in der Post", "Money back in the mail"), money(o.ret) } end
-		if o.waive then s.hint = green(partnerName(o) .. T(" hat dir das Trinkgeld erlassen.", " waived the tip.")) end
-		local owed = O.Owed(o)
-		if owed > 0 then s.hint = red(T("Noch zu zahlen: ", "Still to pay: ") .. money(owed)) end
+		-- per Post verschickt: Zeitpunkt und Restzeit
+		local left = O.Transit(o)
+		if o.shAt then
+			s.hint = partnerName(o) .. T(" hat die Ware um ", " sent the goods at ") .. date("%H:%M", o.shAt) .. T(" Uhr abgeschickt. ", ". ")
+			if left > 0 then
+				s.state, s.chip = "wait", T("unterwegs ", "on the way ") .. O.Clock(left)
+				s.hint = s.hint .. T("Ankunft in höchstens ", "Arrives within ") .. O.Clock(left) .. T(" Minuten.", " minutes.")
+			else
+				s.hint = s.hint .. green(T("Die Post sollte da sein.", "The mail should have arrived."))
+				if s.lines[1] then s.lines[1][2] = green(T("angekommen", "arrived")) end
+			end
+		end
+		addCosts(s, o, ag)
 		s.buttons[1] = { text = T("Erhalten – Auftrag abschließen", "Received – close order"), main = true,
-			fn = function() if owed > 0 then O.ConfirmDone(o) else O.Done(o) end end }
+			fn = function() O.Done(o) end }
 	else
 		s.state, s.chip = "wait", T("wartet auf ", "waiting for ") .. o.from
 		s.hint = T("Der Auftrag verschwindet, sobald der Besteller den Empfang bestätigt.", "The order disappears once the customer confirms receipt.")
@@ -357,7 +364,7 @@ end
 
 local function coinsChanged(box)
 	local o = curId and O.Get(curId)
-	if not o or o.sh or o.paid then return end
+	if not o or o.sh then return end
 	o.mc, o.mcSet = coinCopper(box), true
 	box.token = (box.token or 0) + 1
 	local token = box.token
@@ -454,7 +461,21 @@ local function makeStep(parent, n)
 
 	f.btns = {}
 	for i = 1, MAXBTNS do
-		f.btns[i] = K.Btn(f, "", 100, 20, function(self) if self.fn then self.fn() end end, 11)
+		local b = K.Btn(f, "", 100, 20, function(self) if self.fn then self.fn() end end, 11)
+		-- Haken-Knopf (rechts): Symbol statt Text, Erklaerung beim Ueberfahren
+		b.check = b:CreateTexture(nil, "OVERLAY")
+		b.check:SetSize(20, 20)
+		b.check:SetPoint("CENTER")
+		b.check:SetTexture("Interface\\Buttons\\UI-CheckBox-Check")
+		b.check:Hide()
+		b:SetScript("OnEnter", function(self)
+			if not self.tip then return end
+			GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+			GameTooltip:AddLine(self.tip, 1, 1, 1)
+			GameTooltip:Show()
+		end)
+		b:SetScript("OnLeave", function() GameTooltip:Hide() end)
+		f.btns[i] = b
 	end
 	return f
 end
@@ -528,12 +549,20 @@ local function paintStep(f, s, n)
 			c.text:Hide()
 		end
 	end
-	local x = BODY_X
+	-- Haken und "Rueckgaengig" stehen rechts, alles andere fliesst von links
+	local x, rx, limit = BODY_X, STEP_W - 10, STEP_W - 8
+	for i = 1, MAXBTNS do
+		local spec = s.buttons[i]
+		if spec and spec.tick then limit = limit - 32
+		elseif spec and spec.right then limit = limit - 90 end
+	end
 	for i = 1, MAXBTNS do
 		local b, spec = f.btns[i], s.buttons[i]
 		if spec then
-			b.label:SetText(spec.text)
-			local w = math.max(80, math.ceil(b.label:GetStringWidth()) + 20)
+			b.label:SetText(spec.text or "")
+			b.tip = spec.tip
+			b.check:SetShown(spec.tick and true or false)
+			local w = spec.tick and 26 or math.max(80, math.ceil(b.label:GetStringWidth()) + 20)
 			b:SetWidth(w)
 			b.fn = spec.fn
 			K.setBg(b, spec.main and K.COL.btnOn or K.COL.btn)
@@ -542,14 +571,19 @@ local function paintStep(f, s, n)
 			b:SetEnabled(on)
 			local c = on and K.COL.gold or K.COL.off
 			b.label:SetTextColor(c[1], c[2], c[3])
-			if x > BODY_X and x + w > STEP_W - 8 then
-				x = BODY_X
-				y = y + 25
-			end
 			b:ClearAllPoints()
-			b:SetPoint("TOPLEFT", x, -(y + 5))
+			if spec.tick or spec.right then
+				b:SetPoint("TOPRIGHT", b:GetParent(), "TOPLEFT", rx, -(y + 5))
+				rx = rx - w - 6
+			else
+				if x > BODY_X and x + w > limit then
+					x = BODY_X
+					y = y + 25
+				end
+				b:SetPoint("TOPLEFT", x, -(y + 5))
+				x = x + w + 6
+			end
 			b:Show()
-			x = x + w + 6
 		else
 			b:Hide()
 		end
@@ -558,6 +592,90 @@ local function paintStep(f, s, n)
 	local h = y + 6
 	f:SetHeight(h)
 	return h
+end
+
+-- ---------------------------------------------------------------- Auswahlliste: alle laufenden Auftraege dieser Figur
+local DROP_ROWS, DROP_ROW_H = 10, 24
+
+local function myOrders()
+	local list = {}
+	for _, o in pairs(ns.db.orders or {}) do
+		if o.st == "taken" and O.Role(o) then list[#list + 1] = o end
+	end
+	table.sort(list, function(a, b)
+		local ta, tb = O.MyTurn(a) and true or false, O.MyTurn(b) and true or false
+		if ta ~= tb then return ta end
+		return (a.created or 0) > (b.created or 0)
+	end)
+	return list
+end
+
+local function renderDrop()
+	local d = win.drop
+	local list = myOrders()
+	d.offset = math.max(0, math.min(d.offset or 0, #list - DROP_ROWS))
+	for i = 1, DROP_ROWS do
+		local row, o = d.rows[i], list[d.offset + i]
+		row.id = o and o.id
+		if o then
+			local ag = O.Role(o) == "ag"
+			row.left:SetText(muted("#" .. ns.Mail.Code(o.id)) .. "  " .. o.qty .. "× " .. O.Name(o))
+			local who = (ag and T("bei ", "with ") or T("für ", "for ")) .. (partnerName(o) or "?")
+			local state = O.MyTurn(o) and "|cffe0713a" .. T("du bist dran", "your turn") .. "|r"
+				or "|cff6fb3ff" .. T("wartet", "waiting") .. "|r"
+			row.right:SetText(muted(who) .. "  " .. state)
+			if o.id == curId then row.bg:SetColorTexture(0.29, 0.239, 0.071, 1)
+			else K.setc(row.bg, K.COL.row) end
+			row:Show()
+		else
+			row:Hide()
+		end
+	end
+	local n = math.max(1, math.min(DROP_ROWS, #list))
+	d:SetHeight(n * DROP_ROW_H + 8 + (#list > DROP_ROWS and 14 or 0))
+	d.more:SetShown(#list > DROP_ROWS)
+	d.more:SetText(T("Mausrad: weitere Aufträge", "Mouse wheel: more orders") .. " (" .. #list .. ")")
+end
+
+local function buildDrop(f)
+	local COL = K.COL
+	local d = K.Box(f, COL.bg, COL.goldDim)
+	d:SetWidth(STEP_W)
+	d:SetPoint("TOPLEFT", 10, -32)
+	d:SetFrameStrata("FULLSCREEN_DIALOG")
+	d:EnableMouse(true)
+	d:EnableMouseWheel(true)
+	d:SetScript("OnMouseWheel", function(_, delta)
+		d.offset = (d.offset or 0) - delta
+		renderDrop()
+	end)
+	d.rows = {}
+	for i = 1, DROP_ROWS do
+		local row = CreateFrame("Button", nil, d)
+		row:SetSize(STEP_W - 8, DROP_ROW_H - 2)
+		row:SetPoint("TOPLEFT", 4, -4 - (i - 1) * DROP_ROW_H)
+		row.bg = row:CreateTexture(nil, "BACKGROUND")
+		row.bg:SetAllPoints()
+		local hl = row:CreateTexture(nil, "HIGHLIGHT")
+		hl:SetAllPoints()
+		hl:SetColorTexture(1, 1, 1, 0.08)
+		row.left = K.FS(row, 12, COL.text)
+		row.left:SetPoint("LEFT", 8, 0)
+		row.left:SetWidth(STEP_W - 200)
+		row.right = K.FS(row, 11, COL.muted, "RIGHT")
+		row.right:SetPoint("RIGHT", -8, 0)
+		row.right:SetWidth(175)
+		row:SetScript("OnClick", function(self)
+			d:Hide()
+			if self.id then Task.Open(self.id, true) end
+		end)
+		d.rows[i] = row
+	end
+	d.more = K.FS(d, 10, COL.muted, "CENTER")
+	d.more:SetPoint("BOTTOM", 0, 4)
+	d.more:SetWidth(STEP_W - 20)
+	d:Hide()
+	return d
 end
 
 local function build()
@@ -590,7 +708,45 @@ local function build()
 	local t = K.FS(f, 15, COL.gold)
 	t:SetPoint("TOPLEFT", 12, -10)
 	t:SetText(T("Auftrag", "Order"))
+	-- Auftragsnummer (steht auch im Betreff der Post)
+	-- anklickbar: Auswahl aller laufenden Auftraege
+	f.pick = K.Btn(f, "", 90, 20, function()
+		if f.drop:IsShown() then f.drop:Hide() return end
+		f.drop.offset = 0
+		renderDrop()
+		f.drop:Show()
+	end, 11)
+	f.pick:SetPoint("LEFT", t, "RIGHT", 10, 0)
+	f.pick.label:ClearAllPoints()
+	f.pick.label:SetPoint("LEFT", 8, 0)
+	f.number = f.pick.label
+	f.pick.arrow = f.pick:CreateTexture(nil, "OVERLAY")
+	f.pick.arrow:SetSize(12, 12)
+	f.pick.arrow:SetPoint("RIGHT", -5, -1)
+	f.pick.arrow:SetTexture("Interface\\AddOns\\CraftShare\\Media\\Chevron")
+	f.pick.arrow:SetVertexColor(COL.gold[1], COL.gold[2], COL.gold[3])
+	f.drop = buildDrop(f)
+	f:HookScript("OnHide", function() f.drop:Hide() end)
 	local x = K.Btn(f, "X", 20, 20, function() forget(); f:Hide() end)
+	-- Einklappen wie beim Hauptfenster: Pfeil nach oben = einklappen, nach unten = ausklappen
+	f.fold = K.Btn(f, "", 20, 20, function()
+		folded = not folded
+		GameTooltip:Hide()
+		Task.Refresh()
+	end)
+	f.fold:SetPoint("TOPRIGHT", -32, -8)
+	f.fold.arrow = f.fold:CreateTexture(nil, "OVERLAY")
+	f.fold.arrow:SetSize(14, 14)
+	f.fold.arrow:SetPoint("CENTER", 0, 0)
+	f.fold.arrow:SetTexture("Interface\\AddOns\\CraftShare\\Media\\Chevron")
+	f.fold.arrow:SetVertexColor(COL.gold[1], COL.gold[2], COL.gold[3])
+	f.fold:SetScript("OnEnter", function(self)
+		GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+		GameTooltip:AddLine(folded and T("Auftrag ausklappen", "Expand order") or T("Bis auf die Kopfzeile einklappen", "Collapse to the header"), 1, 1, 1)
+		GameTooltip:Show()
+	end)
+	f.fold:SetScript("OnLeave", function() GameTooltip:Hide() end)
+	f:HookScript("OnHide", function() folded = false end)
 	x:SetPoint("TOPRIGHT", -8, -8)
 
 	local head = K.Box(f, COL.panel, COL.border2)
@@ -609,6 +765,9 @@ local function build()
 		lines[i] = s
 	end
 	head.title, head.who, head.pay = lines[1], lines[2], lines[3]
+	-- Zeitpunkt der Bestellung rechts in der Titelzeile
+	head.created = K.FS(head, 11, COL.muted, "RIGHT")
+	head.created:SetPoint("TOPRIGHT", -10, -9)
 
 	f.steps = {}
 	for i = 1, 5 do f.steps[i] = makeStep(f, i) end
@@ -639,25 +798,43 @@ function Task.Refresh()
 		win:Hide()
 		return
 	end
+	local count = #myOrders()
+	win.number:SetText("#" .. ns.Mail.Code(o.id) .. (count > 1 and ("  |cff9a8f7e(" .. count .. ")|r") or ""))
+	win.pick:SetWidth(math.ceil(win.number:GetStringWidth()) + 30)
+	if win.drop:IsShown() then renderDrop() end
+	-- eingeklappt: nur die Kopfzeile
+	for _, e in ipairs({ win.head, win.all, win.leave, win.whisper }) do e:SetShown(not folded) end
+	if folded then win.fold.arrow:SetTexCoord(0, 1, 0, 1) else win.fold.arrow:SetTexCoord(0, 1, 1, 0) end
+	if folded then
+		for _, f in ipairs(win.steps) do f:Hide() end
+		win:SetHeight(36)
+		return
+	end
 	local ag = O.Role(o) == "ag"
 	local head = win.head
 	head.icon:SetTexture((o.out and o.out > 0) and ns.ItemIcon(o.out) or K.profIcon(o.key, o.pname))
 	head.title:SetText(o.qty .. "× " .. O.Name(o))
+	-- Zeitpunkt beim Besteller steht in der Auftrags-ID; sonst der Eingang beim eigenen Client
+	local at = tonumber(o.id:match("%-(%d+)%-%d+$")) or o.created
+	if at then
+		local today = date("%d.%m.%Y") == date("%d.%m.%Y", at)
+		head.created:SetText(T("Bestellt ", "Ordered ") .. (today and T("heute ", "today ") or date("%d.%m. ", at)) ..
+			date("%H:%M", at))
+	else
+		head.created:SetText("")
+	end
+	head.title:SetWidth(STEP_W - 62 - math.ceil(head.created:GetStringWidth()) - 14)
 	local partner = partnerName(o)
 	head.who:SetText((ag and T("Du bist Auftraggeber · Hersteller: ", "You ordered · crafter: ")
 		or T("Du bist Auftragnehmer · Besteller: ", "You craft · customer: ")) .. partner ..
 		(ns.Roster.IsOnline(partner) and "  " .. green("online") or ""))
-	local tip = ""
-	if (o.tip or 0) > 0 then
-		tip = T("Trinkgeld ", "Tip ") .. money(o.tip) .. (o.waive and " " .. green(T("(erlassen)", "(waived)")) or "") .. " · "
-	end
-	head.pay:SetText(tip .. (o.mats == "self" and T("Material stellt der Auftraggeber", "materials from the customer")
-		or T("Material besorgt der Hersteller", "crafter gets the materials")))
+	local note = (o.note or "") ~= "" and (" · „" .. o.note .. "“") or ""
+	head.pay:SetText((o.mats == "self" and T("Material stellt der Auftraggeber", "materials from the customer")
+		or T("Material besorgt der Hersteller", "crafter gets the materials")) .. note)
 	win.leave.label:SetText(ag and T("Zurückziehen", "Withdraw") or T("Zurückgeben", "Give back"))
 
 	local steps = {}
 	if o.mats == "self" then steps[#steps + 1] = stepMaterials(o, ag) end
-	if O.HasPayment(o) then steps[#steps + 1] = stepPayment(o, ag) end
 	steps[#steps + 1] = stepCraft(o, ag)
 	steps[#steps + 1] = stepShip(o, ag)
 	steps[#steps + 1] = stepReceive(o, ag)
@@ -847,6 +1024,19 @@ cast:SetScript("OnEvent", function(_, event, unit, message, spellID)
 	end
 end)
 
+-- Restzeit der Post laufend anzeigen (und einmal beim Ablauf)
+local ticking = false
+if C_Timer.NewTicker then
+	C_Timer.NewTicker(1, function()
+		if not (win and win:IsShown() and curId and O) then return end
+		local o = O.Get(curId)
+		local role = o and O.Role(o)
+		local running = (role == "ag" and O.Transit(o) > 0) or (role == "an" and O.MatTransit(o) > 0) or false
+		if running or ticking then Task.Refresh() end
+		ticking = running
+	end)
+end
+
 local ev = CreateFrame("Frame")
 ev:RegisterEvent("BAG_UPDATE_DELAYED")
 ev:RegisterEvent("GET_ITEM_INFO_RECEIVED")
@@ -864,7 +1054,10 @@ function Task.Open(id, keepList)
 	K, O = K or ns.UIK, ns.Orders
 	local o = O.Get(id)
 	if not o or o.st ~= "taken" or not O.Role(o) then return end
-	if not win then build() end
+	if not win then
+		build()
+		ns.UI.Dockable(win)
+	end
 	curId = id
 	ui().openTask[ns.Me()] = id
 	ui().lastTask = id

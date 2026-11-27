@@ -1,8 +1,8 @@
 -- CraftShare: Post zu angenommenen Auftraegen.
--- Beim Oeffnen des Briefkastens werden offene Sendungen vorbereitet (Empfaenger, Betreff, Anhaenge, Geld);
+-- Beim Oeffnen des Briefkastens werden offene Sendungen vorbereitet (Empfaenger, Betreff, Anhaenge, Nachnahme);
 -- auf "Senden" drueckt immer der Spieler. Gesendete und aus der Post genommene Briefe haken die Schritte ab.
--- Betreff: "CraftShare #<Kennung> <Art>: <Auftrag>", Art = Material/Teilmaterial/Geld (Besteller -> Hersteller),
--- Ware/Teilware/Rueckgabe (Hersteller -> Besteller)
+-- Betreff: lesbarer Text, am Ende die Auftragsnummer, z. B. "Material für 1x Balg #96E6". Die Art des Briefs steht in
+-- den ersten Worten (siehe SUBJECT). Aeltere Formen ("CraftShare #96E6 Material: ...") werden weiter erkannt.
 local ADDON, ns = ...
 local M = {}
 ns.Mail = M
@@ -12,7 +12,7 @@ local K, O
 local MAX_ATTACH = ATTACHMENTS_MAX_SEND or 12
 local PANEL_W, ROWS, ROW_H = 260, 4, 66
 local FINAL = { Material = true, Ware = true }
-local TO_CRAFTER = { Material = true, Teilmaterial = true, Geld = true }
+local TO_CRAFTER = { Material = true, Teilmaterial = true }
 
 local mailOpen = false
 local panel
@@ -20,7 +20,6 @@ local prepToken = 0
 local preparing
 local prepared      -- { id, note }
 local outgoing      -- Brief, der gerade verschickt wird
-local lastMoney = 0 -- zuletzt fuer den Brief gesetztes Geld
 local notes = {}    -- Hinweise je Auftrag
 
 -- kurze Kennung aus der Auftrags-ID (steht im Betreff)
@@ -30,8 +29,25 @@ function M.Code(id)
 	return string.format("%04X", h)
 end
 
+-- Anfang des Betreffs je Art des Briefs (deutsch, englisch)
+local SUBJECT = {
+	Material = { "Material für ", "Materials for " },
+	Teilmaterial = { "Teil-Material für ", "Partial materials for " },
+	Ware = { "Fertig: ", "Done: " },
+	Teilware = { "Teil-Lieferung: ", "Partial delivery: " },
+	Rueckgabe = { "Zurück: ", "Returned: " },
+}
+
 local function parseSubject(s)
 	if type(s) ~= "string" then return end
+	local code = s:match("#(%x%x%x%x)%s*$")
+	if code then
+		for label, words in pairs(SUBJECT) do
+			for _, w in ipairs(words) do
+				if s:sub(1, #w) == w then return code, label end
+			end
+		end
+	end
 	return s:match("^CraftShare #(%x%x%x%x) (%a+)")
 end
 
@@ -42,15 +58,98 @@ local function sameName(a, b)
 	return a == b or a:match("^%S+") == b or b:match("^%S+") == a
 end
 
+-- auf hoechstens n Byte kuerzen, ohne einen Umlaut zu zerschneiden
+local function shorten(s, n)
+	if #s <= n then return s end
+	local cut = n
+	while cut > 1 and s:byte(cut + 1) and s:byte(cut + 1) >= 128 and s:byte(cut + 1) < 192 do cut = cut - 1 end
+	return s:sub(1, cut)
+end
+
 local function subjectFor(id, label, title)
-	local s = "CraftShare #" .. M.Code(id) .. " " .. label .. ": " .. title
-	if #s > 63 then
-		local cut = 63
-		-- nicht mitten in einem Umlaut abschneiden
-		while cut > 1 and s:byte(cut + 1) and s:byte(cut + 1) >= 128 and s:byte(cut + 1) < 192 do cut = cut - 1 end
-		s = s:sub(1, cut)
+	local tag = " #" .. M.Code(id)
+	local text = T(SUBJECT[label][1], SUBJECT[label][2]) .. title
+	-- lange Namen kuerzen, die Auftragsnummer bleibt immer erhalten
+	return shorten(text, 63 - #tag) .. tag
+end
+
+local INTRO = {
+	Material = { "hier das Material für deinen Auftrag:", "here are the materials for your order:" },
+	Teilmaterial = { "hier ein erster Teil des Materials für deinen Auftrag:", "here is part of the materials for your order:" },
+	Ware = { "dein Auftrag ist fertig:", "your order is done:" },
+	Teilware = { "hier ein erster Teil deines Auftrags:", "here is part of your order:" },
+	Rueckgabe = { "ich kann den Auftrag leider nicht erledigen, hier dein Material zurück:",
+		"I cannot complete the order, here are your materials back:" },
+}
+
+local function plainMoney(c)
+	local g, s, k = math.floor(c / 10000), math.floor(c % 10000 / 100), c % 100
+	local t = {}
+	if g > 0 then t[#t + 1] = g .. "g" end
+	if s > 0 then t[#t + 1] = s .. "s" end
+	if k > 0 or #t == 0 then t[#t + 1] = k .. "k" end
+	return table.concat(t, " ")
+end
+
+local function itemLines(list)
+	local t = {}
+	for _, e in ipairs(list) do t[#t + 1] = "- " .. e[2] .. "x " .. (ns.ItemName(e[1]) or ("item:" .. e[1])) end
+	return t
+end
+
+-- Mailtext (hoechstens 500 Zeichen): Anrede, Auftrag, Inhalt, Fehlendes, Nachnahme, Notiz, Bestelldatum, Gruss
+-- data: Datenzeile am Ende (der Auftrag selbst, fuer den Empfaenger lesbar fuers Addon)
+local function bodyFor(ship, label, attached, missing, cod, data)
+	local o = ship.o
+	if data then
+		data = T("Code für die Offline-Bestellung (bitte nicht ändern):",
+			"Code for the offline order (please do not edit):") .. "\n" .. data
 	end
-	return s
+	local room = 495 - (data and (#data + 2) or 0)
+	local head = { T("Hallo ", "Hello ") .. (ship.partner or "") .. ",", "", T(INTRO[label][1], INTRO[label][2]) }
+	head[#head + 1] = ship.title
+	local tail = {}
+	if cod and cod > 0 then
+		tail[#tail + 1] = ""
+		tail[#tail + 1] = T("Per Nachnahme: ", "Cash on delivery: ") .. plainMoney(cod)
+	end
+	if o and (o.note or "") ~= "" then
+		tail[#tail + 1] = ""
+		tail[#tail + 1] = T("Notiz: ", "Note: ") .. o.note
+	end
+	local at = o and tonumber(o.id:match("%-(%d+)%-%d+$"))
+	if at then
+		if #tail == 0 then tail[#tail + 1] = "" end
+		tail[#tail + 1] = T("Bestellt am ", "Ordered on ") .. date("%d.%m.", at) .. T(" um ", " at ") .. date("%H:%M", at) .. "."
+	end
+	for _, l in ipairs({ "", T("Danke und Gruß", "Thanks and regards"), ns.Me() or "", "", "(Guild CraftShare)" }) do
+		tail[#tail + 1] = l
+	end
+	local items, rest = itemLines(attached), itemLines(missing or {})
+	local function build()
+		local t = {}
+		for _, l in ipairs(head) do t[#t + 1] = l end
+		local function block(title, lines, full)
+			if full == 0 then return end
+			t[#t + 1] = ""
+			t[#t + 1] = title
+			for _, l in ipairs(lines) do t[#t + 1] = l end
+			if full > #lines then t[#t + 1] = T("- und " .. (full - #lines) .. " weitere", "- and " .. (full - #lines) .. " more") end
+		end
+		block(T("Beiliegend:", "Attached:"), items, #attached)
+		block(T("Es fehlt noch:", "Still missing:"), rest, #(missing or {}))
+		for _, l in ipairs(tail) do t[#t + 1] = l end
+		return table.concat(t, "\n")
+	end
+	local body = build()
+	-- zu lang: Listen von hinten kuerzen
+	while #body > room and (#items > 1 or #rest > 1) do
+		if #items >= #rest then table.remove(items) else table.remove(rest) end
+		body = build()
+	end
+	body = shorten(body, math.max(0, room))
+	if data then body = body .. "\n\n" .. data end
+	return body
 end
 
 -- ---------------------------------------------------------------- Taschen
@@ -133,27 +232,21 @@ local function remaining(o, kind)
 	return out
 end
 
--- offene Sendung eines Auftrags: Art, Gegenstaende, Geld
--- M Material (+ Geld), G nur Geld, W Ware (+ Rueckgabe), R Rueckgabe zum Auftrag
+-- offene Sendung eines Auftrags: Art, Gegenstaende, Nachnahmebetrag
+-- M Material, W Ware (bei Materialkosten per Nachnahme, sobald im Spiel wieder moeglich)
 local function orderShipment(o)
-	if o.st ~= "taken" then return end
+	if o.st ~= "taken" or o.sh then return end
 	local role = O.Role(o)
 	if role == "ag" then
-		local owed = O.Owed(o)
-		if o.mats == "self" and not o.ms and not o.mr and (o.cr or 0) == 0 and not o.sh then
+		if o.mats == "self" and not o.ms and not o.mr and (o.cr or 0) == 0 then
 			local items = remaining(o, "M")
-			if #items > 0 then return "M", items, owed end
+			if #items > 0 then return "M", items, 0 end
 		end
-		if owed > 0 then return "G", {}, owed end
 	elseif role == "an" then
-		local refund = O.Refund(o)
-		local mailable = o.out and o.out > 0
-		local made = (o.cr or 0) >= o.qty
-		if mailable and made and not o.sh then
+		if o.out and o.out > 0 and (o.cr or 0) >= o.qty then
 			local items = remaining(o, "W")
-			if #items > 0 then return "W", items, refund end
+			if #items > 0 then return "W", items, O.COD_ENABLED and O.CodAmount(o) or 0 end
 		end
-		if refund > 0 and (o.sh or (not mailable and made)) then return "R", {}, refund end
 	end
 end
 
@@ -166,18 +259,16 @@ local function availability(ship)
 		if n < e[2] then missing = missing + (e[2] - n) end
 	end
 	ship.have, ship.missing = have, missing
-	ship.poor = ship.money > 0 and GetMoney and GetMoney() < ship.money or false
-	if #ship.items > 0 then ship.sendable = have > 0
-	else ship.sendable = ship.money > 0 and not ship.poor end
+	ship.sendable = have > 0
 end
 
 function M.Shipments()
 	local list = {}
 	O = O or ns.Orders
 	for id, o in pairs(ns.db.orders or {}) do
-		local kind, items, amount = orderShipment(o)
+		local kind, items, cod = orderShipment(o)
 		if kind then
-			list[#list + 1] = { id = id, o = o, kind = kind, items = items, money = amount or 0,
+			list[#list + 1] = { id = id, o = o, kind = kind, items = items, cod = cod or 0,
 				partner = (O.Role(o) == "ag") and o.by or o.from, title = o.qty .. "x " .. O.Name(o), t = o.created or 0 }
 		end
 	end
@@ -186,8 +277,10 @@ function M.Shipments()
 		if j.owner == ns.Me() then
 			local items = {}
 			for _, e in ipairs(j.items) do if e[2] > 0 then items[#items + 1] = { e[1], e[2] } end end
-			list[#list + 1] = { id = id, job = j, kind = "X", items = items, money = j.money or 0,
-				partner = j.to, title = j.name, t = j.t or 0 }
+			if #items > 0 then
+				list[#list + 1] = { id = id, job = j, kind = "X", items = items, cod = 0,
+					partner = j.to, title = j.name, t = j.t or 0 }
+			end
 		end
 	end
 	for _, ship in ipairs(list) do availability(ship) end
@@ -217,7 +310,7 @@ local function coins(copper)
 	return math.floor(copper / 10000), math.floor(copper % 10000 / 100), copper % 100
 end
 
-local function fillForm(recipient, subject, body, amount)
+local function fillForm(recipient, subject, body, cod)
 	local k = kerzo()
 	if k and k:IsShown() and k.campoPara then
 		k.campoPara.autocompletandoInterno = true
@@ -226,9 +319,10 @@ local function fillForm(recipient, subject, body, amount)
 		k.campoAsunto:SetText(subject)
 		k.campoAsunto:SetCursorPosition(0)
 		if k.campoCuerpo then k.campoCuerpo:SetText(body) end
-		if k.radioEnviar then k.radioEnviar:Click() end
+		local radio = cod > 0 and k.radioCOD or k.radioEnviar
+		if radio then radio:Click() end
 		if k.campoOro then
-			local g, s, c = coins(amount)
+			local g, s, c = coins(cod)
 			k.campoOro:SetText(g > 0 and tostring(g) or "")
 			k.campoPlata:SetText(s > 0 and tostring(s) or "")
 			k.campoCobre:SetText(c > 0 and tostring(c) or "")
@@ -246,8 +340,15 @@ local function fillForm(recipient, subject, body, amount)
 	elseif MailEditBox and MailEditBox.SetText then
 		MailEditBox:SetText(body)
 	end
-	if SendMailSendMoneyButton and SendMailSendMoneyButton:IsEnabled() then SendMailSendMoneyButton:Click() end
-	if SendMailMoney and MoneyInputFrame_SetCopper then MoneyInputFrame_SetCopper(SendMailMoney, amount) end
+	local button = cod > 0 and SendMailCODButton or SendMailSendMoneyButton
+	if button and button:IsEnabled() then button:Click() end
+	if SendMailMoney and MoneyInputFrame_SetCopper then MoneyInputFrame_SetCopper(SendMailMoney, cod) end
+end
+
+local function showStart()
+	local k = kerzo()
+	local box = (k and k:IsShown() and k.campoAsunto) or SendMailSubjectEditBox
+	if box and box.SetCursorPosition then box:SetCursorPosition(0) end
 end
 
 -- ---------------------------------------------------------------- Vorbereiten
@@ -321,6 +422,7 @@ function M.Prepare(ship)
 		local function attach()
 			if token ~= prepToken or not mailOpen then return end
 			local slot = 0
+			local attached, byItem = {}, {}
 			for _, j in ipairs(jobs) do
 				slot = slot + 1
 				pickup(j.bag, j.slot)
@@ -330,30 +432,44 @@ function M.Prepare(ship)
 					complete = false
 					problem = T("Ein Gegenstand ließ sich nicht anhängen.", "An item could not be attached.")
 					slot = slot - 1
+				elseif byItem[j.id] then
+					byItem[j.id][2] = byItem[j.id][2] + j.n
+				else
+					byItem[j.id] = { j.id, j.n }
+					attached[#attached + 1] = byItem[j.id]
 				end
 			end
 			C_Timer.After(0.4, function()
 				if token ~= prepToken or not mailOpen then return end
 				preparing = nil
-				if slot == 0 and (#wanted > 0 or ship.money == 0) and not (kind == "X" and ship.money > 0) then
+				if slot == 0 then
 					notes[id0] = problem or T("Nichts zum Verschicken in den Taschen.", "Nothing to send in your bags.")
 					M.Refresh()
 					return
 				end
-				local label, amount = "Rueckgabe", ship.money
+				local label, cod = "Rueckgabe", 0
 				if kind == "M" then
 					label = complete and "Material" or "Teilmaterial"
-					if not complete then amount = 0 end -- Geld geht mit dem abschliessenden Brief
 				elseif kind == "W" then
 					label = complete and "Ware" or "Teilware"
-					if not complete then amount = 0 end
-				elseif kind == "G" then
-					label = "Geld"
+					if complete then cod = ship.cod end -- Nachnahme nur auf dem abschliessenden Brief
 				end
-				local body = ((kind == "X" or kind == "R") and T("Rückgabe über CraftShare: ", "Return via CraftShare: ")
-					or T("Auftrag über CraftShare: ", "Order via CraftShare: ")) .. ship.title
-				fillForm(ship.partner, subjectFor(id0, label, ship.title), body, amount)
-				prepared = { id = id0, plan = plan, money = amount }
+				-- was fehlt noch (nur bei Teillieferungen)
+				local missing = {}
+				if not complete then
+					for _, e in ipairs(wanted) do
+						local left = e[2] - (byItem[e[1]] and byItem[e[1]][2] or 0)
+						if left > 0 then missing[#missing + 1] = { e[1], left } end
+					end
+				end
+				-- Direktauftrag mit Material: der abschliessende Brief traegt den Auftrag selbst
+				local data
+				if label == "Material" and o and o.to ~= "*" then data = O.MailData(o) end
+				if data and #data > 330 then data = nil end
+				local body = bodyFor(ship, label, attached, missing, cod, data)
+				fillForm(ship.partner, subjectFor(id0, label, ship.title), body, cod)
+				C_Timer.After(0.2, showStart)
+				prepared = { id = id0, plan = plan }
 				notes[id0] = (not complete) and (T("Teillieferung. ", "Partial delivery. ") .. (problem or "")) or nil
 				M.Refresh()
 			end)
@@ -400,8 +516,6 @@ end
 local function onSendMail(recipient, subject)
 	outgoing = nil
 	local code, label = parseSubject(subject)
-	local amount = (GetSendMailMoney and GetSendMailMoney()) or lastMoney or 0
-	lastMoney = 0
 	if not code or not GetSendMailItem then return end
 	local items = {}
 	for i = 1, MAX_ATTACH do
@@ -414,7 +528,7 @@ local function onSendMail(recipient, subject)
 			if itemID then items[itemID] = (items[itemID] or 0) + (count or 1) end
 		end
 	end
-	outgoing = { code = code, label = label, to = recipient, items = items, money = amount }
+	outgoing = { code = code, label = label, to = recipient, items = items }
 end
 
 local function returnJob(code, to)
@@ -426,30 +540,25 @@ end
 local function onSendSuccess()
 	local out = outgoing
 	outgoing = nil
-	if not out or (not next(out.items) and out.money == 0) then return end
-	local label, amount = out.label, out.money
+	if not out or not next(out.items) then return end
+	local label = out.label
 	local id, o, what
 
 	if TO_CRAFTER[label] then
 		o = orderFor(out.code, "ag", out.to)
 		if not o then return end
 		id = o.id
-		if label ~= "Geld" and next(out.items) then
-			-- Liste ab jetzt festhalten
-			o.plan = o.plan or (prepared and prepared.id == id and prepared.plan) or O.SendList(o)
-			o.sentM = o.sentM or {}
-			for item, n in pairs(out.items) do o.sentM[item] = (o.sentM[item] or 0) + n end
-			if #remaining(o, "M") == 0 then o.ms = true end
-			what = T("Material verschickt an ", "Materials sent to ")
-		else
-			what = T("Geld verschickt an ", "Money sent to ")
-		end
-		if amount > 0 then o.paid = (o.paid or 0) + amount end
-	elseif label == "Rueckgabe" and returnJob(out.code, out.to) then
+		-- Liste ab jetzt festhalten
+		o.plan = o.plan or (prepared and prepared.id == id and prepared.plan) or O.SendList(o)
+		o.sentM = o.sentM or {}
+		for item, n in pairs(out.items) do o.sentM[item] = (o.sentM[item] or 0) + n end
+		if #remaining(o, "M") == 0 then o.ms, o.msAt = true, O.Now() end
+		what = T("Material verschickt an ", "Materials sent to ")
+	elseif label == "Rueckgabe" then
 		local job
 		id, job = returnJob(out.code, out.to)
-		job.money = math.max(0, (job.money or 0) - amount)
-		local open = job.money
+		if not job then return end
+		local open = 0
 		for _, e in ipairs(job.items) do
 			e[2] = math.max(0, e[2] - (out.items[e[1]] or 0))
 			open = open + e[2]
@@ -460,19 +569,14 @@ local function onSendSuccess()
 		o = orderFor(out.code, "an", out.to)
 		if not o then return end
 		id = o.id
-		if (label == "Ware" or label == "Teilware") and next(out.items) then
-			o.sentW = o.sentW or {}
-			for item, n in pairs(out.items) do o.sentW[item] = (o.sentW[item] or 0) + n end
-			if #remaining(o, "W") == 0 then o.sh = true end
-			what = T("Ware verschickt an ", "Goods sent to ")
-		else
-			what = T("Rückgabe verschickt an ", "Return sent to ")
-		end
-		if amount > 0 then o.ret = (o.ret or 0) + amount end
+		o.sentW = o.sentW or {}
+		for item, n in pairs(out.items) do o.sentW[item] = (o.sentW[item] or 0) + n end
+		if #remaining(o, "W") == 0 then o.sh, o.shAt = true, O.Now() end
+		what = T("Ware verschickt an ", "Goods sent to ")
 	end
 
 	prepared, notes[id] = nil, nil
-	ns.Print(what .. (out.to or "?") .. (amount > 0 and (" (" .. ns.Prices.Money(amount) .. ")") or "") .. ".")
+	ns.Print(what .. (out.to or "?") .. ".")
 	if o then O.Push(o) else O.Refresh() end
 	-- naechste Sendung vorbereiten
 	if M.Auto() then
@@ -487,8 +591,8 @@ end
 
 -- ---------------------------------------------------------------- Empfangen
 local function header(i)
-	local _, _, sender, subject, amount, _, _, itemCount, _, wasReturned = GetInboxHeaderInfo(i)
-	return sender, subject, itemCount or 0, wasReturned, amount or 0
+	local _, _, sender, subject, _, _, _, itemCount, _, wasReturned = GetInboxHeaderInfo(i)
+	return sender, subject, itemCount or 0, wasReturned
 end
 
 -- Auftrag zu einem eingegangenen Brief und die Seite, an die er gerichtet ist
@@ -497,19 +601,35 @@ local function incoming(code, label, sender)
 	return orderFor(code, role, sender), role
 end
 
+-- Materialpost zu einem Auftrag, den dieses Addon noch nicht kennt: aus dem Brieftext anlegen.
+-- (Das Lesen markiert den Brief als gelesen; nur solche Briefe werden gelesen.)
+local function orderFromMail(i, code, sender)
+	if not GetInboxText or not sender then return end
+	for id in pairs(ns.db.orders or {}) do
+		if M.Code(id) == code then return end
+	end
+	O.FromMail((GetInboxText(i)), sender)
+end
+
 local function scanInbox()
 	if not GetInboxNumItems then return end
 	for i = 1, GetInboxNumItems() do
-		local sender, subject, items, returned, amount = header(i)
+		local sender, subject, items, returned = header(i)
 		local code, label = parseSubject(subject)
 		if code and not returned then
+			if label == "Material" and items > 0 then orderFromMail(i, code, sender) end
 			local o, role = incoming(code, label, sender)
 			-- die Post ist da, also wurde verschickt (falls die Nachricht dazu noch fehlt)
 			if o then
 				local news
-				if role == "an" and label == "Material" and items > 0 and not o.ms and not o.mr then o.ms, news = true, true end
-				if role == "an" and amount > 0 and not o.paid then o.paid, news = amount, true end
-				if role == "ag" and label == "Ware" and items > 0 and not o.sh then o.sh, news = true, true end
+				if role == "an" and label == "Material" and items > 0 then
+					if not o.ms and not o.mr then o.ms, news = true, true end
+					if not o.matArrived then o.matArrived, news = true, true end -- liegt im Briefkasten
+				end
+				if role == "ag" and label == "Ware" and items > 0 then
+					if not o.sh then o.sh, news = true, true end
+					if not o.arrived then o.arrived, news = true, true end -- liegt im Briefkasten
+				end
 				if news then O.Refresh() end
 			end
 		end
@@ -518,7 +638,6 @@ end
 
 local checkTokens = {}
 local taking = {}   -- Auftraege, deren Post gerade entnommen wird (nur solange der Briefkasten offen ist)
-local warned = {}
 local function checkTaken(id)
 	checkTokens[id] = (checkTokens[id] or 0) + 1
 	local token = checkTokens[id]
@@ -528,55 +647,36 @@ local function checkTaken(id)
 		local o = ns.db.orders and ns.db.orders[id]
 		if not o or not GetInboxNumItems then return end
 		local code, role = M.Code(id), O.Role(o)
-		-- liegen noch Anhaenge oder Geld zu diesem Auftrag im Briefkasten?
-		local itemsLeft, moneyLeft = false, false
+		-- liegen noch Anhaenge zu diesem Auftrag im Briefkasten?
 		for i = 1, GetInboxNumItems() do
-			local sender, subject, items, returned, amount = header(i)
+			local sender, subject, items, returned = header(i)
 			local c, label = parseSubject(subject)
-			if c == code and not returned then
+			if c == code and items > 0 and not returned then
 				local _, r = incoming(c, label, sender)
-				if r == role then
-					if items > 0 then itemsLeft = true end
-					if amount > 0 then moneyLeft = true end
-				end
+				if r == role then return end
 			end
 		end
-		if role == "an" then
-			local news
-			if o.finalTaken and not itemsLeft and not o.mr then
-				o.mr, news = true, true
-				ns.Print(T("Material erhalten für ", "Materials received for ") .. o.qty .. "× " .. O.Name(o))
-			end
-			if o.moneyTaken and not moneyLeft and not o.mg then
-				o.mg, news = true, true
-				ns.Print(T("Geld erhalten für ", "Money received for ") .. o.qty .. "× " .. O.Name(o))
-			end
-			if news then O.Push(o) end
-		elseif role == "ag" and o.finalTaken and not itemsLeft then
-			local owed = O.Owed(o)
-			if owed > 0 then
-				if not warned[id] then
-					warned[id] = true
-					ns.Print(T("Ware erhalten, noch zu zahlen: ", "Goods received, still to pay: ") .. ns.Prices.Money(owed))
-				end
-			else
-				ns.Print(T("Auftrag abgeschlossen: ", "Order completed: ") .. o.qty .. "× " .. O.Name(o))
-				O.Done(o)
-			end
+		if not o.finalTaken then return end
+		if role == "an" and not o.mr then
+			o.mr = true
+			ns.Print(T("Material erhalten für ", "Materials received for ") .. o.qty .. "× " .. O.Name(o))
+			O.Push(o)
+		elseif role == "ag" then
+			ns.Print(T("Auftrag abgeschlossen: ", "Order completed: ") .. o.qty .. "× " .. O.Name(o))
+			O.Done(o)
 		end
 	end)
 end
 
 -- etwas wird aus der Post genommen (laeuft nach dem Aufruf, der Brief ist dann noch in der Liste)
-local function onTake(index, what)
+local function onTake(index)
 	if not index or not GetInboxHeaderInfo then return end
-	local sender, subject, items, returned, amount = header(index)
+	local sender, subject, items, returned = header(index)
 	local code, label = parseSubject(subject)
 	if not code or returned then return end
-	local o, role = incoming(code, label, sender)
+	local o = incoming(code, label, sender)
 	if not o then return end
-	if what ~= "money" and items > 0 and FINAL[label] then o.finalTaken = true end
-	if what ~= "item" and amount > 0 and role == "an" then o.moneyTaken = true end
+	if items > 0 and FINAL[label] then o.finalTaken = true end
 	taking[o.id] = true
 	checkTaken(o.id)
 end
@@ -635,7 +735,7 @@ local function buildPanel()
 
 	local t = K.FS(f, 13, COL.gold)
 	t:SetPoint("TOPLEFT", 10, -9)
-	t:SetText(T("CraftShare: Sendungen", "CraftShare: shipments"))
+	t:SetText(T("Guild CraftShare: Sendungen", "Guild CraftShare: shipments"))
 	local x = K.Btn(f, "X", 20, 20, function() f.closed = true; f:Hide() end)
 	x:SetPoint("TOPRIGHT", -6, -6)
 
@@ -665,7 +765,7 @@ local function buildPanel()
 			GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
 			GameTooltip:AddLine(ship.title, 1, 1, 1)
 			for _, e in ipairs(ship.items) do GameTooltip:AddLine(K.itemText(e[1], e[2]), 0.9, 0.9, 0.9) end
-			if ship.money > 0 then GameTooltip:AddLine(T("Geld: ", "Money: ") .. ns.Prices.Money(ship.money), 0.9, 0.9, 0.9) end
+			if ship.cod > 0 then GameTooltip:AddLine(T("Nachnahme: ", "Cash on delivery: ") .. ns.Prices.Money(ship.cod), 0.9, 0.9, 0.9) end
 			if notes[ship.id] then GameTooltip:AddLine(notes[ship.id], 1, 0.6, 0.4, true) end
 			if ship.job then GameTooltip:AddLine(T("Rechtsklick: Rückgabe verwerfen", "Right-click: discard return"), 0.6, 0.6, 0.6) end
 			GameTooltip:Show()
@@ -682,13 +782,6 @@ local function buildPanel()
 	end
 
 	f.more = K.FS(f, 11, COL.muted)
-	f.chk = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
-	f.chk:SetSize(22, 22)
-	f.chk:SetPoint("BOTTOMLEFT", 6, 4)
-	f.chk:SetScript("OnClick", function(self) ns.db.autoMail = self:GetChecked() and true or false end)
-	local ct = K.FS(f, 11, COL.muted)
-	ct:SetPoint("LEFT", f.chk, "RIGHT", 2, 0)
-	ct:SetText(T("Automatisch vorbereiten", "Prepare automatically"))
 end
 
 -- Ist ein Postfenster zu sehen? Kerzo Postal schliesst seine Fenster, ohne dass das Spiel den Briefkasten
@@ -741,16 +834,13 @@ function M.Refresh()
 		row.ship = s
 		if s then
 			local id = s.id
-			local m = s.money > 0 and ns.Prices.Money(s.money) or nil
-			local what
+			local what = s.title
 			if s.kind == "M" then
-				what = T("Material", "Materials") .. (m and (" + " .. m) or "") .. T(" für ", " for ") .. s.title
-			elseif s.kind == "G" then
-				what = m .. T(" für ", " for ") .. s.title
-			elseif s.kind == "W" then
-				what = s.title .. (m and (" + " .. m .. T(" zurück", " back")) or "")
-			else
-				what = T("Rückgabe: ", "Return: ") .. (m and (m .. " ") or "") .. s.title
+				what = T("Material für ", "Materials for ") .. s.title
+			elseif s.kind == "X" then
+				what = T("Rückgabe: ", "Return: ") .. s.title
+			elseif s.cod > 0 then
+				what = s.title .. T(" per Nachnahme", " cash on delivery")
 			end
 			row.who:SetText(T("an ", "to ") .. (s.partner or "?"))
 			row.what:SetText(what)
@@ -759,8 +849,7 @@ function M.Refresh()
 			elseif prepared and prepared.id == id then
 				state = "|cff4fd05a" .. T("vorbereitet, bitte senden", "ready, please send") .. "|r"
 			elseif notes[id] then state = "|cffe8a96a" .. notes[id] .. "|r"
-			elseif s.poor then state = "|cffd9544a" .. T("nicht genug Geld", "not enough money") .. "|r"
-			elseif #s.items > 0 and s.have == 0 then state = "|cffd9544a" .. T("nichts in den Taschen", "nothing in your bags") .. "|r"
+			elseif s.have == 0 then state = "|cffd9544a" .. T("nichts in den Taschen", "nothing in your bags") .. "|r"
 			elseif s.missing > 0 then state = "|cffe8a96a" .. s.missing .. T(" Teile fehlen", " items missing") .. "|r"
 			else state = T("alles dabei", "all there") end
 			row.state:SetText(state)
@@ -781,8 +870,7 @@ function M.Refresh()
 	else
 		panel.more:Hide()
 	end
-	panel:SetHeight(h + 30)
-	panel.chk:SetChecked(M.Auto())
+	panel:SetHeight(h + 4)
 	panel.dockSide = nil -- neu ausrichten
 	dock(panel)
 	panel:Show()
@@ -795,7 +883,6 @@ local function onOpen()
 	if ticker then ticker:Cancel() end
 	ticker = C_Timer.NewTicker and C_Timer.NewTicker(0.3, watchWindows)
 	wipe(notes)
-	wipe(warned)
 	if panel then panel.closed = nil end
 	K, O = ns.UIK, ns.Orders
 	C_Timer.After(0.6, function()
@@ -820,6 +907,129 @@ local function onClose()
 	if panel then panel:Hide() end
 end
 
+-- gleich nach einer Bestellung mit Material: steht man schon am Briefkasten, Post vorbereiten
+function M.PrepareOrder(id)
+	if not mailOpen then return end
+	M.Refresh()
+	for _, ship in ipairs(M.Shipments()) do
+		if ship.id == id and ship.sendable then return M.Prepare(ship) end
+	end
+end
+
+-- ---------------------------------------------------------------- Aus der Bank holen
+local bankToken = 0
+
+-- Fachnummern der Charakterbank (je nach Spielversion Faecher, Bankbeutel oder Bankreiter)
+local function bankContainers()
+	local list, seen = {}, {}
+	local equipped = NUM_TOTAL_EQUIPPED_BAG_SLOTS or NUM_BAG_SLOTS or 4
+	local function add(i)
+		if type(i) == "number" and not seen[i] and (i < 0 or i > equipped) then
+			seen[i] = true
+			list[#list + 1] = i
+		end
+	end
+	if Enum and Enum.BagIndex then
+		for key, value in pairs(Enum.BagIndex) do
+			if key:find("Bank") and not key:find("Account") then add(value) end
+		end
+	end
+	if #list == 0 then
+		add(-1)
+		for i = equipped + 1, equipped + 7 do add(i) end
+	end
+	table.sort(list)
+	return list
+end
+
+local function bankStacks(itemID)
+	local list = {}
+	for _, bag in ipairs(bankContainers()) do
+		for slot = 1, numSlots(bag) do
+			local id, count, locked = slotInfo(bag, slot)
+			if id == itemID and not locked then list[#list + 1] = { bag = bag, slot = slot, n = count } end
+		end
+	end
+	table.sort(list, function(a, b) return a.n > b.n end)
+	return list
+end
+
+-- items = { { id = Gegenstand, n = Menge }, ... }: genau diese Mengen in freie Taschenfaecher legen
+function M.FetchFromBank(items)
+	if not M.bankOpen or InCombatLockdown() then return end
+	if CursorHasItem and CursorHasItem() then
+		ns.Print(T("Bitte zuerst den Gegenstand am Mauszeiger ablegen.", "Please drop the item on your cursor first."))
+		return
+	end
+	bankToken = bankToken + 1
+	local token = bankToken
+	local moves = {}
+	for _, it in ipairs(items) do
+		local rest = it.n
+		local left = {}
+		for _, s in ipairs(bankStacks(it.id)) do
+			if s.n <= rest then
+				moves[#moves + 1] = { bag = s.bag, slot = s.slot, n = s.n, whole = true }
+				rest = rest - s.n
+			else
+				left[#left + 1] = s
+			end
+		end
+		-- Rest vom kleinsten ausreichenden Stapel abteilen
+		if rest > 0 and left[#left] then
+			moves[#moves + 1] = { bag = left[#left].bag, slot = left[#left].slot, n = math.min(rest, left[#left].n) }
+		end
+	end
+	if #moves == 0 then
+		ns.Print(T("Auf der Bank nichts Passendes gefunden.", "Nothing suitable found in the bank."))
+		return
+	end
+	local used, moved = {}, 0
+	local function step(i)
+		if token ~= bankToken or not M.bankOpen then return end
+		local m = moves[i]
+		if not m then
+			ns.Print(string.format(T("%d Stapel aus der Bank geholt.", "%d stacks fetched from the bank."), moved))
+			if ns.Task then ns.Task.Refresh() end
+			return
+		end
+		local bag, slot = emptySlot(used)
+		if not bag then
+			ns.Print(T("Kein freier Taschenplatz.", "No free bag slot."))
+			return
+		end
+		used[bag .. ":" .. slot] = true
+		if m.whole then pickup(m.bag, m.slot) else split(m.bag, m.slot, m.n) end
+		pickup(bag, slot)
+		local tries = 30
+		local function wait()
+			if token ~= bankToken then return end
+			local _, count, locked = slotInfo(bag, slot)
+			if count == m.n and not locked then
+				moved = moved + 1
+				return C_Timer.After(0.1, function() step(i + 1) end)
+			end
+			tries = tries - 1
+			if tries <= 0 then
+				if CursorHasItem and CursorHasItem() then ClearCursor() end
+				ns.Print(T("Ein Stapel ließ sich nicht aus der Bank holen.", "Could not move a stack from the bank."))
+				return
+			end
+			C_Timer.After(0.1, wait)
+		end
+		wait()
+	end
+	step(1)
+end
+
+local bankEvents = CreateFrame("Frame")
+for _, e in ipairs({ "BANKFRAME_OPENED", "BANKFRAME_CLOSED" }) do pcall(bankEvents.RegisterEvent, bankEvents, e) end
+bankEvents:SetScript("OnEvent", function(_, event)
+	M.bankOpen = (event == "BANKFRAME_OPENED") or nil
+	if not M.bankOpen then bankToken = bankToken + 1 end
+	if ns.Task then C_Timer.After(0.3, ns.Task.Refresh) end
+end)
+
 -- /cs post: warum wird (k)eine Sendung angeboten?
 function M.Debug()
 	O = ns.Orders
@@ -830,9 +1040,9 @@ function M.Debug()
 	for _, o in pairs(ns.db.orders or {}) do
 		if o.st == "taken" and O.Role(o) then
 			n = n + 1
-			local kind, items, amount = orderShipment(o)
-			ns.Print(string.format("%s: Rolle %s, hergestellt %d/%d, mr %s, ms %s, sh %s, bezahlt %d, Sendung %s (Geld %d)",
-				O.Name(o), O.Role(o), o.cr or 0, o.qty, yn(o.mr), yn(o.ms), yn(o.sh), o.paid or 0, kind or "keine", amount or 0))
+			local kind, items = orderShipment(o)
+			ns.Print(string.format("%s: Rolle %s, hergestellt %d/%d, mr %s, ms %s, sh %s, Sendung %s",
+				O.Name(o), O.Role(o), o.cr or 0, o.qty, yn(o.mr), yn(o.ms), yn(o.sh), kind or "keine"))
 			items = items or { { o.out or 0, o.qty * (o.outq or 1) } }
 			for _, e in ipairs(items) do
 				local stacks, bound = stacksOf(e[1])
@@ -883,8 +1093,6 @@ end)
 
 if hooksecurefunc then
 	if SendMail then hooksecurefunc("SendMail", onSendMail) end
-	if SetSendMailMoney then hooksecurefunc("SetSendMailMoney", function(c) lastMoney = c or 0 end) end
-	if TakeInboxItem then hooksecurefunc("TakeInboxItem", function(i) onTake(i, "item") end) end
-	if TakeInboxMoney then hooksecurefunc("TakeInboxMoney", function(i) onTake(i, "money") end) end
-	if AutoLootMailItem then hooksecurefunc("AutoLootMailItem", function(i) onTake(i, "all") end) end
+	if TakeInboxItem then hooksecurefunc("TakeInboxItem", onTake) end
+	if AutoLootMailItem then hooksecurefunc("AutoLootMailItem", onTake) end
 end

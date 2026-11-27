@@ -167,12 +167,14 @@ local function scanOpenProfession()
 	end
 
 	local prof = c.profs[key] or {}
+	local before = prof.recipes
 	prof.name = pname or key
 	prof.recipes = recipes
 	prof.count = count
 	prof.cats = cats
 	local newSig = count .. ":" .. sig
-	local changed = prof.sig ~= newSig
+	local stamped = ns.Comm and ns.Comm.Stamp(prof, before or {})
+	local changed = stamped or prof.sig ~= newSig
 	prof.sig = newSig
 	c.profs[key] = prof
 	return true, changed

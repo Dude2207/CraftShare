@@ -9,7 +9,7 @@ ns.Prices = P
 local producers = {}
 local memo, busy = {}, {}
 
-local DEFAULTS = { source = "latest", ptype = "min", vendor = true, chain = true, show = true, free = false, scraps = true }
+local DEFAULTS = { source = "latest", ptype = "min", vendor = true, chain = true, show = true, free = false }
 local SCRAP_ID = 2934 -- Verdorbene Lederfetzen
 
 local function usesScraps(prod)
@@ -22,17 +22,6 @@ end
 function P.UsesScraps(prod) return usesScraps(prod) end
 
 -- Hat eine eigene Figur Lederverarbeitung?
-function P.HasLeatherworking()
-	for name, c in pairs(ns.db.chars or {}) do
-		if ns.IsMine(name) then
-			for _, p in pairs(c.profs or {}) do
-				local n = (p.name or ""):lower()
-				if n:find("lederverarbeitung", 1, true) or n:find("leatherworking", 1, true) then return true end
-			end
-		end
-	end
-	return false
-end
 local SOURCES = { "latest", "auctionator", "tsm", "scan" }
 
 function P.SourceLabel(s)
@@ -147,7 +136,7 @@ local function ensureAHButtonInner()
 	bar.txt:SetPoint("CENTER", track, "CENTER", 0, 0)
 	b:SetScript("OnEnter", function(self)
 		GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
-		GameTooltip:AddLine("CraftShare", 1, 0.82, 0.2)
+		GameTooltip:AddLine("Guild CraftShare", 1, 0.82, 0.2)
 		GameTooltip:AddLine(T("Liest die Preise aller Rohstoffe und Produkte der bekannten Rezepte ein.", "Reads prices of all materials and products of known recipes."), 1, 1, 1, true)
 		GameTooltip:Show()
 	end)
@@ -230,7 +219,7 @@ function P.Unit(id, depth)
 	if bp then best = { unit = bp, how = how } end
 	local ps = P.Settings()
 	local prod = ps.chain and producers[id]
-	if prod and not ps.scraps and usesScraps(prod) then prod = nil end
+	if prod and usesScraps(prod) then prod = nil end
 	if prod and depth < 4 and not busy[id] and #prod.r > 0 then
 		busy[id] = true
 		local total, ok = 0, true
@@ -256,7 +245,7 @@ function P.Compare(id)
 	local make
 	local ps = P.Settings()
 	local prod = ps.chain and producers[id]
-	if prod and not ps.scraps and usesScraps(prod) then prod = nil end
+	if prod and usesScraps(prod) then prod = nil end
 	if prod and #prod.r > 0 then
 		local total, ok = 0, true
 		for _, r in ipairs(prod.r) do
@@ -417,7 +406,7 @@ function P.StatusText()
 	if not avail then
 		local vendorN = 0
 		for _ in pairs(ns.db.vendor or {}) do vendorN = vendorN + 1 end
-		local txt = T("Keine Preisdaten – Optionen › AH scannen", "No price data – Options › scan AH")
+		local txt = T("Keine Preisdaten – im Auktionshaus scannen", "No price data – scan at the auction house")
 		if s.vendor and vendorN > 0 then txt = txt .. T(" (Händlerpreise werden genutzt)", " (vendor prices in use)") end
 		return txt, false
 	end
@@ -459,13 +448,25 @@ function P.DiagText()
 	return string.format("AH-Fenster: %s · Schnittstelle: %s · %s · Takt: %d%s", f and (f:GetName() or "?") or "nicht gefunden", api, info, P.ticks or 0, P.ahErr and (" · Fehler: " .. P.ahErr) or "")
 end
 
-function P.ScanText()
-	local n, t = P.ScanInfo()
-	if P.scanning then return P.progress or T("Scan läuft …", "Scanning …") end
-	local base = n > 0 and string.format(T("Eigener Scan: %d Gegenstände · %s", "Own scan: %d items · %s"), n, agoText(time() - t))
-		or T("Eigener Scan: noch keine Daten", "Own scan: no data yet")
-	if not P.IsAHOpen() then base = base .. " · " .. T("Auktionshaus öffnen", "open auction house") end
-	return base
+-- Fuer die Optionen: welche Preisdaten die neuesten sind und von wann
+function P.NewestText()
+	local best, bt
+	local function try(name, ok)
+		if not ok then return end
+		local t = sourceTime(name)
+		if t and (not bt or t > bt) then best, bt = name, t end
+	end
+	try("scan", P.ScanInfo() > 0)
+	try("auctionator", hasAuctionator())
+	try("tsm", hasTSM())
+	if not best then
+		return T("Noch keine Preisdaten (im Auktionshaus scannen).", "No price data yet (scan at the auction house).")
+	end
+	local text = T("Aktuellste Preisdaten: ", "Newest price data: ") .. P.SourceLabel(best) .. "\n" ..
+		T("Stand: ", "As of: ") .. date("%d.%m. %H:%M", bt) .. " (" .. agoText(math.max(0, time() - bt)) .. ")"
+	local used = P.Settings().source
+	if used ~= "latest" and used ~= best then text = text .. T(" · verwendet: ", " · in use: ") .. P.SourceLabel(used) end
+	return text
 end
 
 -- ---------------------------------------------------------------- Haendlerpreise lernen
@@ -512,7 +513,7 @@ local function finish(msg)
 	P.scanning = false
 	P.progress = nil
 	P.queue = nil
-	if msg then print("|cffffd24aCraftShare:|r " .. msg) end
+	if msg then print("|cffffd24aGuild CraftShare:|r " .. msg) end
 	P.Notify()
 end
 
@@ -686,17 +687,17 @@ function P.StartScan()
 		return
 	end
 	if not P.IsAHOpen() then
-		print("|cffffd24aCraftShare:|r " .. T("Bitte zuerst das Auktionshaus öffnen.", "Please open the auction house first."))
+		print("|cffffd24aGuild CraftShare:|r " .. T("Bitte zuerst das Auktionshaus öffnen.", "Please open the auction house first."))
 		return
 	end
 	local modern = _G.C_AuctionHouse and C_AuctionHouse.SendBrowseQuery and C_AuctionHouse.GetBrowseResults
 	if not modern and not (QueryAuctionItems and GetNumAuctionItems and GetAuctionItemInfo) then
-		print("|cffffd24aCraftShare:|r " .. T("Auktionshaus-Schnittstelle nicht verfügbar.", "Auction house API not available."))
+		print("|cffffd24aGuild CraftShare:|r " .. T("Auktionshaus-Schnittstelle nicht verfügbar.", "Auction house API not available."))
 		return
 	end
 	local set, list, reagentN = wantedItems()
 	if #list == 0 then
-		print("|cffffd24aCraftShare:|r " .. T("Keine Rezepte bekannt – es gibt nichts zu scannen.", "No known recipes – nothing to scan."))
+		print("|cffffd24aGuild CraftShare:|r " .. T("Keine Rezepte bekannt – es gibt nichts zu scannen.", "No known recipes – nothing to scan."))
 		return
 	end
 	P.scanning = true
@@ -763,7 +764,7 @@ C_Timer.NewTicker(1, function()
 end)
 
 function P.Debug()
-	local function say(t) print("|cffffd24aCraftShare AH:|r " .. t) end
+	local function say(t) print("|cffffd24aGuild CraftShare AH:|r " .. t) end
 	say("AuctionHouseFrame=" .. tostring(_G.AuctionHouseFrame ~= nil) .. " AuctionFrame=" .. tostring(_G.AuctionFrame ~= nil))
 	say("C_AuctionHouse=" .. tostring(_G.C_AuctionHouse ~= nil) .. " SendBrowseQuery=" .. tostring(_G.C_AuctionHouse and C_AuctionHouse.SendBrowseQuery ~= nil) .. " QueryAuctionItems=" .. tostring(QueryAuctionItems ~= nil))
 	say("IsAHOpen=" .. tostring(P.IsAHOpen()) .. " Button=" .. tostring(P.ahButton ~= nil))

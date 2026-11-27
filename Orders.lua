@@ -4,13 +4,14 @@
 --   T|id|by     Besteller bestaetigt: Auftrag gehoert <by> (an den Hersteller und, bei "*", an alle)
 --   N|id|by     Besteller lehnt ab: schon vergeben an <by>
 --   W|id        Bestellung zurueckgezogen
+--   C|id        Hersteller bricht ab (lehnt die Bestellung ab); bei Direktbestellungen ist sie damit beendet
 --   D|id        Auftrag erledigt (Hersteller -> Besteller, Besteller -> alle)
---   M|id|ms|paid   Stand des Bestellers: Material verschickt (0/1), geschicktes Geld in Kupfer
---   H|id|mr|cr|sh|waive|mc|mg|ret   Stand des Herstellers: Material erhalten, Anzahl hergestellt, Ware verschickt,
---               Trinkgeld erlassen, Materialkosten in Kupfer (leer = noch offen), Geld erhalten,
---               zurueckgeschicktes Geld in Kupfer
--- Bezahlt wird im Voraus: der Besteller schickt Trinkgeld (und ggf. Materialkosten) per Post. Erlaesst der
--- Hersteller das Trinkgeld oder gibt er den Auftrag zurueck, schickt er das Geld zurueck.
+--   M|id|ms|msAt  Stand des Bestellers: Material verschickt (0/1), Zeitpunkt des Postversands (Serverzeit)
+--   H|id|mr|cr|sh|0|mc|0|0|shAt   Stand des Herstellers: Material erhalten, Anzahl hergestellt, Ware verschickt,
+--               Materialkosten in Kupfer, Zeitpunkt des Postversands (Serverzeit); die Nullen sind unbenutzt
+-- Stellt der Besteller das Material, geht der Auftrag nur an eine bestimmte Person und gilt als angenommen. Er wird
+-- aber erst gesendet, wenn das Material verschickt ist (bis dahin o.hold).
+-- Besorgt der Hersteller das Material, sollen die Kosten per Nachnahme bezahlt werden (derzeit abgeschaltet).
 -- M und H enthalten immer den ganzen eigenen Stand und koennen beliebig oft wiederholt werden (Nachreichen
 -- nach Offline-Zeiten). Jede Seite schreibt nur ihre eigenen Felder.
 -- Der Besteller entscheidet allein ueber die Vergabe: wer zuerst annimmt, bekommt den Auftrag.
@@ -18,7 +19,9 @@ local ADDON, ns = ...
 local O = {}
 ns.Orders = O
 local T = ns.T
-O.KINDS = { O = true, A = true, T = true, N = true, W = true, D = true, R = true, U = true, M = true, H = true }
+-- Nachnahme ist im Spiel derzeit deaktiviert. Sobald sie wieder geht: auf true setzen.
+O.COD_ENABLED = false
+O.KINDS = { O = true, A = true, T = true, N = true, W = true, D = true, R = true, U = true, M = true, H = true, C = true }
 
 local seq = 0
 local K
@@ -35,6 +38,9 @@ local function db()
 end
 
 local function me() return ns.Me() end
+-- Nachricht an eine Person: direkt, oder ueber die Gilde als Bote, wenn sie offline ist
+local function deliver(name, msg) ns.Relay.Send(name, msg) end
+local sendOrder, wantsOrder -- weiter unten definiert, schon von O.Resync gebraucht
 
 local function changed()
 	if ns.Mini and ns.Mini.Update then ns.Mini.Update() end
@@ -44,12 +50,45 @@ end
 
 -- ---------------------------------------------------------------- Auftragsstand
 local function clearProgress(o)
-	o.ms, o.mr, o.cr, o.sh, o.waive, o.mc, o.mcSet = nil, nil, nil, nil, nil, nil, nil
+	o.ms, o.mr, o.cr, o.sh, o.mc, o.mcSet = nil, nil, nil, nil, nil, nil
 	-- Post: festgehaltene Materialliste, schon verschickte Mengen, abschliessender Brief entnommen
 	o.plan, o.sentM, o.sentW, o.finalTaken = nil, nil, nil, nil
-	-- Geld: geschickt, angekommen, zurueckgeschickt
-	o.paid, o.mg, o.ret, o.moneyTaken = nil, nil, nil, nil
-	o.mcPrev, o.mcPrevSet = nil, nil
+	o.mcPrev, o.mcPrevSet, o.shAt, o.arrived, o.ack = nil, nil, nil, nil, nil
+	o.msAt, o.matArrived = nil, nil
+end
+
+-- Material kommt vom Besteller und der Auftrag ging an eine bestimmte Person
+local function isDirect(o)
+	return o.mats == "self" and o.to ~= "*"
+end
+
+-- Post mit Anhang braucht im Spiel bis zu einer Stunde
+local TRANSIT = 3600
+
+function O.Now()
+	return (GetServerTime and GetServerTime()) or time()
+end
+
+-- Sekunden, bis die per Post verschickte Ware da ist; 0, wenn nichts (mehr) unterwegs ist
+local function remainingTransit(sentAt, partner)
+	-- zwischen eigenen Charakteren kommt Post sofort an
+	if not sentAt or ns.IsMine(partner) then return 0 end
+	return math.max(0, math.min(TRANSIT, sentAt + TRANSIT - O.Now()))
+end
+
+function O.Transit(o)
+	if not o.sh or o.arrived then return 0 end
+	return remainingTransit(o.shAt, o.from == ns.Me() and o.by or o.from)
+end
+
+-- dasselbe fuer das Material auf dem Weg zum Hersteller
+function O.MatTransit(o)
+	if not o.ms or o.mr or o.matArrived then return 0 end
+	return remainingTransit(o.msAt, o.from == ns.Me() and o.by or o.from)
+end
+
+function O.Clock(sec)
+	return string.format("%d:%02d", math.floor(sec / 60), math.floor(sec % 60))
 end
 
 -- Was der Besteller schickt: Rohstoffe; ein schon fertiges Zwischenprodukt in den Taschen ersetzt seine Rohstoffe.
@@ -80,20 +119,12 @@ end
 -- "ag" (Besteller), "an" (Hersteller dieses Auftrags) oder nil
 function O.Role(o)
 	if o.from == me() then return "ag" end
-	if o.by == me() then return "an" end
+	if o.by == me() and not o.hold then return "an" end
 end
 
 local function partnerOf(o)
 	if o.from == me() then return o.by end
 	return o.from
-end
-
--- Fluestern nur, wenn der Partner nicht nachweislich offline ist (sonst Fehlermeldung im Chat)
-local function tell(name, msg)
-	if not name or ns.IsMine(name) then return end
-	local e = ns.Roster.Get(name)
-	if e and not e.online then return end
-	ns.Comm.Send(msg, "WHISPER", name)
 end
 
 -- abgeschlossene/zurueckgezogene Auftraege merken, damit ein offline gewesener Partner es noch erfaehrt
@@ -106,18 +137,23 @@ end
 local function bit01(v) return v and "1" or "0" end
 
 local function stateMessage(o)
-	if O.Role(o) == "ag" then return "M|" .. o.id .. "|" .. bit01(o.ms) .. "|" .. (o.paid or 0) end
-	return table.concat({ "H", o.id, bit01(o.mr), o.cr or 0, bit01(o.sh), bit01(o.waive), o.mc or "",
-		bit01(o.mg), o.ret or 0 }, "|")
+	if O.Role(o) == "ag" then return "M|" .. o.id .. "|" .. bit01(o.ms) .. "|" .. (o.msAt or "") end
+	return table.concat({ "H", o.id, bit01(o.mr), o.cr or 0, bit01(o.sh), 0, o.mc or "", 0, 0, o.shAt or "" }, "|")
 end
 
 -- eigenen Stand an den Partner schicken und anzeigen
 function O.Push(o)
-	-- Materialkosten stehen fest, sobald verschickt oder bezahlt wurde
-	if O.Role(o) == "an" and o.mats == "crafter" and not o.sh and not o.mcSet and not o.paid then
+	-- Materialkosten stehen fest, sobald verschickt wurde
+	if O.Role(o) == "an" and o.mats == "crafter" and not o.sh and not o.mcSet then
 		o.mc = O.SuggestMatCost(o)
 	end
-	if o.st == "taken" and O.Role(o) then tell(partnerOf(o), stateMessage(o)) end
+	-- zurueckgehaltener Auftrag: Material ist raus, jetzt erst senden
+	if o.hold and o.ms then
+		o.hold = nil
+		if not ns.IsMine(o.to) then O.SendAgain(o) end
+		ns.Print(string.format(T("Auftrag an %s gesendet.", "Order sent to %s."), o.to))
+	end
+	if o.st == "taken" and O.Role(o) and not o.hold then deliver(partnerOf(o), stateMessage(o)) end
 	changed()
 end
 
@@ -128,12 +164,17 @@ function O.Resync(name)
 	if synced[name] and now - synced[name] < 30 then return end
 	synced[name] = now
 	for _, o in pairs(db()) do
-		if o.st == "taken" and O.Role(o) and partnerOf(o) == name then
-			ns.Comm.Send(stateMessage(o), "WHISPER", name)
+		if o.st == "pending" and o.waiting and o.from == name then deliver(name, "A|" .. o.id) end
+		-- offene Bestellungen, die die Person verpasst hat (sie war beim Bestellen offline)
+		if wantsOrder(o, name) then sendOrder(o, name) end
+		if o.st == "taken" and not o.hold and O.Role(o) and partnerOf(o) == name then
+			-- Direktauftrag, den der Hersteller noch nicht bestaetigt hat: noch einmal schicken
+			if O.Role(o) == "ag" and isDirect(o) and not o.ack then O.SendAgain(o) end
+			deliver(name, stateMessage(o))
 		end
 	end
 	for id, g in pairs(ns.db.ordersGone or {}) do
-		if g.p == name and g.mine == me() then ns.Comm.Send(g.k .. "|" .. id, "WHISPER", name) end
+		if g.p == name and g.mine == me() then deliver(name, g.k .. "|" .. id) end
 	end
 end
 
@@ -149,73 +190,51 @@ function O.SuggestMatCost(o)
 	return math.floor(total + 0.5), unknown
 end
 
--- Zu zahlen: Trinkgeld (falls nicht erlassen) + Materialkosten (falls der Hersteller besorgt).
--- Zweiter Wert false: die Materialkosten stehen noch nicht fest.
-function O.Due(o)
-	local tip = o.waive and 0 or (o.tip or 0)
-	if o.mats ~= "crafter" then return tip, true end
+-- Betrag fuer die Nachnahme: Materialkosten, falls der Hersteller das Material besorgt.
+-- Zweiter Wert false: die Kosten stehen noch nicht fest.
+function O.CodAmount(o)
+	if o.mats ~= "crafter" then return 0, true end
 	local mc = o.mc
 	if not mc and O.Role(o) == "an" then mc = O.SuggestMatCost(o) end
-	return tip + (mc or 0), mc ~= nil
+	return mc or 0, mc ~= nil
 end
 
--- was der Besteller noch schicken muss
-function O.Owed(o)
-	local due, known = O.Due(o)
-	if not known then return 0, false end
-	return math.max(0, due - (o.paid or 0)), true
-end
-
--- was der Hersteller zurueckschicken muss (z. B. erlassenes Trinkgeld)
-function O.Refund(o)
-	if not o.paid then return 0 end
-	local due, known = O.Due(o)
-	if not known then return 0 end
-	return math.max(0, o.paid - due - (o.ret or 0))
-end
-
-function O.HasPayment(o)
-	return (o.tip or 0) > 0 or o.mats == "crafter" or o.paid ~= nil
-end
-
--- Endet ein angenommener Auftrag beim Hersteller (eigene Figur), bevor Geld/Material zurueck sind, bleibt eine
--- Rueckgabe offen, die am Briefkasten vorbereitet wird. reason: "back" (zurueckgegeben/-gezogen), "done"
+-- Gibt der Hersteller (eigene Figur) einen Auftrag auf, fuer den er Material bekommen hat, bleibt eine
+-- Rueckgabe offen, die am Briefkasten vorbereitet wird.
 function O.QueueReturn(o, reason)
-	if not (o.by and ns.IsMine(o.by)) or o.from == o.by then return end
-	local money = (o.paid or 0) - (o.ret or 0)
-	if reason == "done" then
-		local due, known = O.Due(o)
-		money = known and (money - due) or 0
-	end
-	money = math.max(0, money)
+	if reason ~= "back" or not (o.by and ns.IsMine(o.by)) or o.from == o.by or not (o.ms or o.mr) then return end
 	local items = {}
-	if reason == "back" and (o.ms or o.mr) then
-		if (o.cr or 0) == 0 then
-			for _, e in ipairs(O.SendList(o)) do items[#items + 1] = { e[1], e[2] } end
-		else
-			for _, e in ipairs(o.r) do
-				local q = e[2] * (o.qty - o.cr)
-				if q > 0 then items[#items + 1] = { e[1], q } end
-			end
+	if (o.cr or 0) == 0 then
+		for _, e in ipairs(O.SendList(o)) do items[#items + 1] = { e[1], e[2] } end
+	else
+		for _, e in ipairs(o.r) do
+			local q = e[2] * (o.qty - o.cr)
+			if q > 0 then items[#items + 1] = { e[1], q } end
 		end
 	end
-	if money == 0 and #items == 0 then return end
+	if #items == 0 then return end
 	ns.db.returns = ns.db.returns or {}
 	ns.db.returns[o.id] = { id = o.id, owner = o.by, to = o.from, name = o.qty .. "x " .. O.Name(o),
-		money = money, items = items, t = time() }
+		items = items, t = time() }
 	if o.by == me() then
-		ns.Print(string.format(T("Bitte an %s zurückschicken (wird am Briefkasten vorbereitet).",
-			"Please send back to %s (prepared at the mailbox)."), o.from))
+		ns.Print(string.format(T("Bitte das Material an %s zurückschicken (wird am Briefkasten vorbereitet).",
+			"Please send the materials back to %s (prepared at the mailbox)."), o.from))
 	end
 end
 
--- Kurzer Stand eines angenommenen Auftrags fuer die Liste
 function O.StageText(o)
-	if o.sh then return T("Ware verschickt", "goods sent") end
+	if o.sh then
+		local left = O.Transit(o)
+		if left > 0 then return T("Ware unterwegs, noch ", "goods on the way, ") .. math.ceil(left / 60) .. T(" Min.", " min") end
+		return T("Ware verschickt", "goods sent")
+	end
 	if (o.cr or 0) >= o.qty then return T("hergestellt", "crafted") end
 	if (o.cr or 0) > 0 then return o.cr .. T(" von ", " of ") .. o.qty .. T(" hergestellt", " crafted") end
 	if o.mats == "self" then
+		if o.hold then return T("noch nicht gesendet: erst Material verschicken", "not sent yet: mail the materials first") end
 		if o.mr then return T("Material angekommen", "materials arrived") end
+		local left = O.MatTransit(o)
+		if left > 0 then return T("Material unterwegs, noch ", "materials on the way, ") .. math.ceil(left / 60) .. T(" Min.", " min") end
 		if o.ms then return T("Material unterwegs", "materials on the way") end
 		return T("wartet auf Material", "waiting for materials")
 	end
@@ -244,12 +263,12 @@ end
 function O.List(dir)
 	local out = {}
 	for _, o in pairs(db()) do
-		local accepted = o.st == "taken" and o.by == me()
+		local accepted = o.st == "taken" and o.by == me() and not o.hold
 		if o.from == me() then
 			if dir == "out" then out[#out + 1] = o end
 		elseif accepted then
 			if dir == "mine" then out[#out + 1] = o end
-		elseif dir == "in" and not o.dismissed and O.HasProfession(o.key)
+		elseif dir == "in" and not o.dismissed and not o.hold and O.HasProfession(o.key)
 			and (o.to == "*" or ns.ShortName(o.to) == me()) then
 			-- (die Liste liegt im Account-weiten Speicher: Direkt-Bestellungen an andere Charaktere gehoeren nicht hierher)
 			out[#out + 1] = o
@@ -274,16 +293,13 @@ end
 
 -- Bin ich bei diesem angenommenen Auftrag am Zug?
 function O.MyTurn(o)
-	local made = (o.cr or 0) >= o.qty
 	if O.Role(o) == "ag" then
-		if o.sh then return true end -- Ware abholen
-		if O.Owed(o) > 0 then return true end -- Geld schicken
+		if o.sh then return O.Transit(o) == 0 end -- Ware abholen, sobald sie da ist
 		return o.mats == "self" and not o.ms and not o.mr and (o.cr or 0) == 0 -- Material schicken
 	end
-	if O.Refund(o) > 0 and (o.sh or made) then return true end -- Geld zurueckschicken
-	if o.paid and not o.mg then return true end -- Geld abholen
 	if o.sh then return false end
-	if made then return true end -- Ware verschicken
+	if (o.cr or 0) >= o.qty then return true end -- Ware verschicken
+	if o.mats == "self" and O.MatTransit(o) > 0 then return false end -- Material noch unterwegs
 	return o.mats == "crafter" or o.mr or o.ms or false -- Material holen bzw. herstellen
 end
 
@@ -328,9 +344,46 @@ local function encode(o)
 	return s
 end
 
-local function sendOrder(o)
+-- target: nur an diese Person (Nachreichen), sonst an den Empfaenger bzw. alle
+sendOrder = function(o, target)
 	local msg = encode(o)
-	if o.to == "*" then ns.Comm.Broadcast(msg) else ns.Comm.Send(msg, "WHISPER", o.to) end
+	if target then deliver(target, msg)
+	elseif o.to == "*" then
+		ns.Comm.Broadcast(msg)
+		ns.Relay.Store("*", msg)
+	else deliver(o.to, msg) end
+end
+
+-- Kann diese Person meinen offenen Auftrag bekommen? (Beruf laut gespeicherten Daten, unbekannt = ja)
+wantsOrder = function(o, name)
+	if o.from ~= ns.Me() or o.st ~= "open" or o.hold or ns.IsMine(name) then return false end
+	if o.declined and o.declined[name] then return false end -- hat schon abgelehnt
+	if o.to ~= "*" then return ns.ShortName(o.to) == name end
+	local c = ns.db.chars[name]
+	return not c or next(c.profs) == nil or c.profs[o.key] ~= nil
+end
+
+function O.SendAgain(o) sendOrder(o) end
+
+-- Auftrag als Datenzeile im Brieftext ("|" ist dort ein Steuerzeichen, deshalb "^")
+function O.MailData(o)
+	local msg = encode(o):gsub("%^", " "):gsub("|", "^")
+	return "[CSD:" .. msg .. "]"
+end
+
+-- Der Auftrag steckt in der Materialpost: anlegen, falls er noch nicht angekommen ist
+function O.FromMail(text, sender)
+	local data = type(text) == "string" and text:match("%[CSD:(.-)%]%s*$")
+	if not data then return end
+	local msg = data:gsub("%^", "|")
+	local kind, id = strsplit("|", msg)
+	if kind ~= "O" or not id then return end
+	if not db()[id] then O.OnMessage("O", msg, sender) end
+	local o = db()[id]
+	if o and o.st == "taken" and O.Role(o) == "an" and not o.mr then
+		o.ms, o.matArrived = true, true -- der Brief liegt im Briefkasten
+		changed()
+	end
 end
 
 -- ---------------------------------------------------------------- Aktionen
@@ -342,10 +395,12 @@ function O.Create(spec)
 	local o = {
 		id = id, from = me(), to = spec.to, key = spec.key, pname = spec.pname, rid = spec.rid,
 		out = spec.rec.out or 0, outq = spec.rec.q or 1, qty = spec.qty, mats = spec.mats,
-		tip = spec.tip or 0, note = spec.note or "", r = r, st = "open", created = time(),
+		tip = 0, note = spec.note or "", r = r, st = "open", created = time(),
 	}
+	-- mit Material an eine bestimmte Person: gilt sofort als angenommen
+	if isDirect(o) then o.st, o.by, o.hold = "taken", o.to, true end
 	db()[id] = o
-	sendOrder(o)
+	if not o.hold then sendOrder(o) end
 	changed()
 	return o
 end
@@ -364,10 +419,16 @@ function O.Accept(o)
 		return
 	end
 	o.st = "pending"
-	o.released = nil
-	ns.Comm.Send("A|" .. o.id, "WHISPER", o.from)
+	o.released, o.takenBack = nil, nil
+	-- ist der Besteller offline, bleibt die Annahme vorgemerkt (Gildenbote bzw. beim naechsten Treffen)
+	o.waiting = ns.Relay.IsOffline(o.from) or nil
+	deliver(o.from, "A|" .. o.id)
+	if o.waiting then
+		ns.Print(string.format(T("%s ist offline. Deine Annahme wird zugestellt, sobald möglich.",
+			"%s is offline. Your acceptance is delivered as soon as possible."), o.from))
+	end
 	C_Timer.After(45, function()
-		if o.st == "pending" then
+		if o.st == "pending" and not o.waiting then
 			o.st = "open"
 			ns.Print(T("Keine Antwort von ", "No answer from ") .. o.from .. T(" – Auftrag wieder offen.", " – order is open again."))
 			changed()
@@ -376,27 +437,73 @@ function O.Accept(o)
 	changed()
 end
 
-function O.Ignore(o)
+-- Hersteller lehnt eine Bestellung ab: verschwindet bei ihm, der Besteller sieht sie als abgebrochen
+function O.Decline(o)
+	if ns.History then ns.History.Add(o, "declined", { crafter = true }) end
 	o.dismissed = true
+	if ns.IsMine(o.from) then
+		-- gleicher Account, gleiche Daten
+		if o.to == "*" then
+			o.declined = o.declined or {}
+			o.declined[me()] = true
+		else
+			o.st, o.declinedBy = "declined", me()
+		end
+	else
+		remember(o.id, "C", o.from)
+		deliver(o.from, "C|" .. o.id)
+	end
+	changed()
+end
+
+-- vorgemerkte Annahme zuruecknehmen
+function O.Unaccept(o)
+	if o.st ~= "pending" then return end
+	o.st, o.waiting = "open", nil
+	o.takenBack = true -- kommt doch noch ein Zuschlag, wird er zurueckgegeben
+	ns.Relay.Cancel(o.from, "A", o.id)
+	deliver(o.from, "R|" .. o.id)
+	changed()
+end
+
+-- abgebrochene Bestellung beim Besteller entfernen
+function O.Remove(o)
+	db()[o.id] = nil
 	changed()
 end
 
 function O.Withdraw(o)
+	if ns.History then ns.History.Add(o, "withdrawn") end
+	if not o.hold then ns.Relay.Cancel(o.to, "O", o.id) end
+	-- noch nicht gesendet: einfach verwerfen
+	if o.hold then
+		db()[o.id] = nil
+		changed()
+		return
+	end
 	if o.st == "taken" then
 		remember(o.id, "W", o.by)
 		O.QueueReturn(o, "back")
 	end
 	db()[o.id] = nil
 	local msg = "W|" .. o.id
-	if o.to == "*" then ns.Comm.Broadcast(msg) else ns.Comm.Send(msg, "WHISPER", o.to) end
+	if o.to == "*" then ns.Comm.Broadcast(msg) else deliver(o.to, msg) end
 	changed()
 end
 
 -- Hersteller gibt einen angenommenen Auftrag zurueck: er wird fuer alle wieder offen und erscheint wieder im Eingang.
 function O.Release(o)
 	if o.from == me() or o.by ~= me() then return end
-	if not ns.IsMine(o.from) then ns.Comm.Send("R|" .. o.id, "WHISPER", o.from) end
+	if ns.History then ns.History.Add(o, "released") end
+	if not ns.IsMine(o.from) then deliver(o.from, "R|" .. o.id) end
 	O.QueueReturn(o, "back")
+	if isDirect(o) then
+		-- der Besteller hat ihn nur an mich gerichtet: er wird nicht wieder angeboten
+		remember(o.id, "R", o.from)
+		db()[o.id] = nil
+		changed()
+		return
+	end
 	o.st = "open"
 	o.by = nil
 	o.released = true
@@ -405,6 +512,7 @@ function O.Release(o)
 end
 
 function O.Done(o)
+	if ns.History then ns.History.Add(o, "done") end
 	if o.st == "taken" then
 		remember(o.id, "D", partnerOf(o))
 		O.QueueReturn(o, "done")
@@ -412,9 +520,9 @@ function O.Done(o)
 	db()[o.id] = nil
 	local msg = "D|" .. o.id
 	if o.from == me() then
-		if o.to == "*" then ns.Comm.Broadcast(msg) elseif o.by then ns.Comm.Send(msg, "WHISPER", o.by) end
+		if o.to == "*" then ns.Comm.Broadcast(msg) elseif o.by then deliver(o.by, msg) end
 	else
-		ns.Comm.Send(msg, "WHISPER", o.from)
+		deliver(o.from, msg)
 	end
 	changed()
 end
@@ -427,17 +535,26 @@ function O.Notify(text)
 		toast = U.Box(UIParent, U.COL.bg, U.COL.goldDim, "Button")
 		toast:SetSize(380, 44)
 		toast:SetPoint("TOP", UIParent, "TOP", 0, -150)
-		toast:SetFrameStrata("DIALOG")
+		toast:SetFrameStrata("FULLSCREEN_DIALOG") -- Hinweis immer ueber den Fenstern
 		toast.title = U.FS(toast, 11, U.COL.goldDim)
 		toast.title:SetPoint("TOPLEFT", 12, -7)
-		toast.title:SetText("CraftShare")
+		toast.title:SetText("Guild CraftShare")
 		toast.text = U.FS(toast, 12, U.COL.gold)
 		toast.text:SetPoint("TOPLEFT", 12, -22)
 		toast.text:SetWidth(356)
 		toast:SetScript("OnClick", function(self) self:Hide(); O.OpenList(O.IncomingOpen() > 0 and "in" or nil) end)
 		toast:Hide()
 	end
+	-- Breite nach dem Text, sehr lange Meldungen umbrechen
+	toast.text:SetWidth(0)
+	toast.text:SetWordWrap(false)
 	toast.text:SetText(text)
+	local w = math.ceil(toast.text:GetStringWidth())
+	local width = math.max(260, math.min(600, w + 26))
+	toast.text:SetWidth(width - 24)
+	toast.text:SetWordWrap(true)
+	toast.text:SetText(text)
+	toast:SetSize(width, 30 + math.ceil(toast.text:GetStringHeight()))
 	toast:Show()
 	toast.token = (toast.token or 0) + 1
 	local t = toast.token
@@ -459,6 +576,12 @@ function O.OnMessage(kind, text, sender)
 		local mats, tip, note, reag = f[10], tonumber(f[11]) or 0, f[12] or "", f[13] or ""
 		if not (validName(to) and key and #key > 0 and #key < 20 and pname and rid and out and outq and qty) then return end
 		if qty < 1 or qty > 99 or (mats ~= "self" and mats ~= "crafter") then return end
+		local gone = ns.db.ordersGone and ns.db.ordersGone[id]
+		if gone then
+			-- schon erledigt oder abgelehnt, der Besteller weiss es noch nicht
+			if gone.p == name and gone.mine == me() then deliver(sender, gone.k .. "|" .. id) end
+			return
+		end
 		-- Die Auftrags-ID beginnt mit dem Namen des Bestellers (notfalls nur mit dem Vornamen, solange er seinen vollen Namen noch nicht kennt)
 		local first = name:match("^%S+") or name
 		if db()[id] or not (id:sub(1, #name + 1) == name .. "-" or id:sub(1, #first + 1) == first .. "-") then return end
@@ -475,8 +598,15 @@ function O.OnMessage(kind, text, sender)
 		local o = { id = id, from = name, to = to, key = key, pname = pname, rid = rid, out = out, outq = math.max(1, outq),
 			qty = qty, mats = mats, tip = tip, note = note:sub(1, 60), r = r, st = "open", created = time() }
 		db()[id] = o
-		O.Notify(string.format(T("Neuer Auftrag von %s: %d× %s", "New order from %s: %d× %s"), name, qty, O.Name(o)))
-		changed()
+		if isDirect(o) then
+			o.st, o.by = "taken", me()
+			O.Notify(string.format(T("Auftrag mit Material von %s: %d× %s", "Order with materials from %s: %d× %s"), name, qty, O.Name(o)))
+			O.Push(o) -- Empfang bestaetigen
+		else
+			O.Notify(string.format(T("Neuer Auftrag von %s: %d× %s", "New order from %s: %d× %s"), name, qty, O.Name(o)))
+			changed()
+		end
+		if ns.Mini and ns.Mini.Alert then ns.Mini.Alert() end
 		return
 	end
 
@@ -485,7 +615,7 @@ function O.OnMessage(kind, text, sender)
 		-- Der Partner hat den Abschluss verpasst
 		local g = ns.db.ordersGone and ns.db.ordersGone[id]
 		if (kind == "M" or kind == "H") and g and g.p == name and g.mine == me() then
-			ns.Comm.Send(g.k .. "|" .. id, "WHISPER", sender)
+			deliver(sender, g.k .. "|" .. id)
 		end
 		return
 	end
@@ -494,7 +624,7 @@ function O.OnMessage(kind, text, sender)
 		if o.from ~= name then return end
 		if o.released then
 			-- ich hatte den Auftrag zurueckgegeben, das kam nicht an
-			ns.Comm.Send("R|" .. id, "WHISPER", sender)
+			deliver(sender, "R|" .. id)
 			return
 		end
 		-- der Besteller fuehrt mich als Hersteller (die Bestaetigung ging verloren)
@@ -504,32 +634,31 @@ function O.OnMessage(kind, text, sender)
 		end
 		if o.by ~= me() then return end
 		local ms = (f[3] == "1") or nil
-		local paid = math.max(0, math.min(999999999, math.floor(tonumber(f[4]) or 0)))
-		if paid == 0 then paid = nil end
+		local msAt = ms and tonumber(f[4]) or nil
+		if msAt then msAt = math.min(O.Now(), math.floor(msAt)) end
+		if not ms then o.matArrived = nil end
+		o.msAt = msAt
 		if ms and not o.ms and not o.mr then
 			O.Notify(string.format(T("%s hat das Material verschickt: %d× %s", "%s sent the materials: %d× %s"), name, o.qty, O.Name(o)))
-		elseif paid and paid > (o.paid or 0) then
-			O.Notify(string.format(T("%s hat Geld geschickt: %d× %s", "%s sent money: %d× %s"), name, o.qty, O.Name(o)))
 		end
-		o.ms, o.paid = ms, paid
+		o.ms = ms
 		changed()
 		return
 	elseif kind == "H" then
 		if o.from ~= me() or o.st ~= "taken" or o.by ~= name then return end
-		local mr, sh, waive = (f[3] == "1") or nil, (f[5] == "1") or nil, (f[6] == "1") or nil
+		local mr, sh = (f[3] == "1") or nil, (f[5] == "1") or nil
 		local cr = math.max(0, math.min(o.qty, math.floor(tonumber(f[4]) or 0)))
 		local mc = tonumber(f[7])
 		if mc then mc = math.max(0, math.min(999999999, math.floor(mc))) end
-		local mg = (f[8] == "1") or nil
-		local ret = math.max(0, math.min(999999999, math.floor(tonumber(f[9]) or 0)))
-		if ret == 0 then ret = nil end
+		local shAt = sh and tonumber(f[10]) or nil
+		if shAt then shAt = math.min(O.Now(), math.floor(shAt)) end
+		if not sh then o.arrived = nil end
+		o.shAt, o.ack = shAt, true
 		local note
-		if ret and ret > (o.ret or 0) then note = T("%s schickt dir Geld zurück: %d× %s", "%s sends money back: %d× %s")
-		elseif sh and not o.sh then note = T("%s hat die Ware verschickt: %d× %s", "%s sent the goods: %d× %s")
+		if sh and not o.sh then note = T("%s hat die Ware verschickt: %d× %s", "%s sent the goods: %d× %s")
 		elseif cr >= o.qty and (o.cr or 0) < o.qty then note = T("%s hat alles hergestellt: %d× %s", "%s crafted everything: %d× %s")
-		elseif mr and not o.mr then note = T("%s hat das Material erhalten: %d× %s", "%s received the materials: %d× %s")
-		elseif waive and not o.waive then note = T("%s erlässt dir das Trinkgeld: %d× %s", "%s waives the tip: %d× %s") end
-		o.mr, o.cr, o.sh, o.waive, o.mc, o.mg, o.ret = mr, cr, sh, waive, mc, mg, ret
+		elseif mr and not o.mr then note = T("%s hat das Material erhalten: %d× %s", "%s received the materials: %d× %s") end
+		o.mr, o.cr, o.sh, o.mc = mr, cr, sh, mc
 		if note then O.Notify(string.format(note, name, o.qty, O.Name(o))) end
 		changed()
 		return
@@ -538,18 +667,26 @@ function O.OnMessage(kind, text, sender)
 	if kind == "A" then
 		-- Besteller entscheidet: wer zuerst kommt
 		if o.from ~= me() then return end
-		if o.st == "open" and (o.to == "*" or ns.ShortName(o.to) == name) then
+		if o.st == "taken" and o.by == name then
+			deliver(sender, "T|" .. id .. "|" .. name)
+		elseif o.st == "open" and (o.to == "*" or ns.ShortName(o.to) == name) then
 			o.st = "taken"
 			o.by = name
 			clearProgress(o)
-			ns.Comm.Send("T|" .. id .. "|" .. name, "WHISPER", sender)
+			if o.to == "*" then ns.Relay.Cancel("*", "O", id) end
+			deliver(sender, "T|" .. id .. "|" .. name)
 			if o.to == "*" then ns.Comm.Broadcast("T|" .. id .. "|" .. name) end
 			O.Notify(string.format(T("%s hat deinen Auftrag angenommen: %d× %s", "%s accepted your order: %d× %s"), name, o.qty, O.Name(o)))
 		else
-			ns.Comm.Send("N|" .. id .. "|" .. (o.by or "?"), "WHISPER", sender)
+			deliver(sender, "N|" .. id .. "|" .. (o.by or "?"))
 		end
 	elseif kind == "T" then
 		if name ~= o.from or not f[3] then return end
+		o.waiting = nil
+		if o.takenBack and ns.ShortName(f[3]) == me() then
+			deliver(sender, "R|" .. id)
+			return
+		end
 		local mine = o.st == "pending" and ns.ShortName(f[3]) == me()
 		if o.st ~= "taken" or o.by ~= ns.ShortName(f[3]) then clearProgress(o) end
 		o.st = "taken"
@@ -559,25 +696,53 @@ function O.OnMessage(kind, text, sender)
 		if mine and O.OpenTask then O.OpenTask(o.id, true) end
 	elseif kind == "N" then
 		if name ~= o.from or not f[3] then return end
+		o.waiting = nil
 		if o.st == "pending" then
 			o.st = "taken"
 			o.by = ns.ShortName(f[3])
 			ns.Print(string.format(T("Der Auftrag von %s ist schon an %s vergeben.", "%s's order is already taken by %s."), o.from, o.by))
 			changed()
 		end
+	elseif kind == "C" then
+		-- ein Hersteller bricht ab
+		if o.from ~= me() then return end
+		if o.to == "*" then
+			if o.st ~= "open" then return end
+			o.declined = o.declined or {}
+			if o.declined[name] then return end
+			o.declined[name] = true
+			O.Notify(string.format(T("%s lehnt ab: %d× %s", "%s declined: %d× %s"), name, o.qty, O.Name(o)))
+		else
+			if ns.ShortName(o.to) ~= name or o.st == "declined" then return end
+			if o.st == "taken" then return end -- schon angenommen: dafuer gibt es "Zurueckgeben"
+			if ns.History then ns.History.Add(o, "declined", { partner = name }) end
+			o.st, o.declinedBy = "declined", name
+			O.Notify(string.format(T("%s hat den Auftrag abgebrochen: %d× %s", "%s cancelled the order: %d× %s"), name, o.qty, O.Name(o)))
+		end
+		changed()
 	elseif kind == "W" then
 		if name ~= o.from then return end
-		if o.st == "taken" then O.QueueReturn(o, "back") end
+		if o.st == "taken" then
+			if ns.History then ns.History.Add(o, "withdrawn") end
+			O.QueueReturn(o, "back")
+		end
 		db()[id] = nil
 		changed()
 	elseif kind == "R" then
 		-- Besteller: der Hersteller gibt den Auftrag zurueck, dann ist er fuer alle wieder offen
 		if o.from ~= me() or o.st ~= "taken" or o.by ~= name then return end
+		if ns.History then ns.History.Add(o, "released") end
+		if isDirect(o) then
+			db()[id] = nil
+			O.Notify(string.format(T("%s lehnt ab, das Material kommt zurück: %d× %s", "%s declined, the materials come back: %d× %s"), name, o.qty, O.Name(o)))
+			changed()
+			return
+		end
 		o.st = "open"
 		o.by = nil
 		clearProgress(o)
 		local msg = "U|" .. id
-		if o.to == "*" then ns.Comm.Broadcast(msg) else ns.Comm.Send(msg, "WHISPER", o.to) end
+		if o.to == "*" then ns.Comm.Broadcast(msg) else deliver(o.to, msg) end
 		O.Notify(string.format(T("%s hat den Auftrag zurückgegeben: %d× %s", "%s gave the order back: %d× %s"), name, o.qty, O.Name(o)))
 		changed()
 	elseif kind == "U" then
@@ -596,11 +761,13 @@ function O.OnMessage(kind, text, sender)
 	elseif kind == "D" then
 		if o.from == me() then
 			if name ~= o.by then return end
+			if ns.History then ns.History.Add(o, "done") end
 			db()[id] = nil
 			if o.to == "*" then ns.Comm.Broadcast("D|" .. id) end
 			O.Notify(string.format(T("%s meldet fertig: %d× %s", "%s reports done: %d× %s"), name, o.qty, O.Name(o)))
 		elseif name == o.from then
 			if o.by == me() then
+				if ns.History then ns.History.Add(o, "done") end
 				O.QueueReturn(o, "done")
 				O.Notify(string.format(T("%s hat den Auftrag abgeschlossen: %d× %s", "%s closed the order: %d× %s"), name, o.qty, O.Name(o)))
 			end
@@ -617,8 +784,10 @@ function O.Init()
 	-- alte Auftraege aufraeumen
 	local now = time()
 	for id, o in pairs(db()) do
-		if now - (o.created or 0) > (o.st == "taken" and MAX_AGE_TAKEN or MAX_AGE) then db()[id] = nil
-		elseif o.st == "pending" then o.st = "open" end
+		if now - (o.created or 0) > (o.st == "taken" and MAX_AGE_TAKEN or MAX_AGE) then
+			if ns.History then ns.History.Add(o, "expired") end
+			db()[id] = nil
+		elseif o.st == "pending" and not o.waiting then o.st = "open" end
 	end
 	for id, g in pairs(ns.db.ordersGone or {}) do
 		if now - (g.t or 0) > MAX_AGE_TAKEN then ns.db.ordersGone[id] = nil end
@@ -630,11 +799,20 @@ function O.Init()
 	C_Timer.After(20, function()
 		local names = {}
 		for _, o in pairs(db()) do
-			local p = o.st == "taken" and O.Role(o) and partnerOf(o)
+			local p = o.st == "taken" and not o.hold and O.Role(o) and partnerOf(o)
 			if p and not ns.IsMine(p) then names[p] = true end
 		end
 		for _, g in pairs(ns.db.ordersGone or {}) do
 			if g.mine == me() then names[g.p] = true end
+		end
+		-- eigene offene Bestellungen erneut anbieten (wer offline war, bekommt sie so)
+		for _, o in pairs(db()) do
+			if o.from == me() and o.st == "open" and not o.hold then
+				if o.to == "*" then sendOrder(o) elseif not ns.IsMine(o.to) then names[ns.ShortName(o.to)] = true end
+			end
+		end
+		for _, o in pairs(db()) do
+			if o.st == "pending" and o.waiting and o.from ~= me() then names[o.from] = true end
 		end
 		for p in pairs(names) do
 			local e = ns.Roster.Get(p)
@@ -780,10 +958,17 @@ local function refreshOrderForm()
 	K.setSeg(w.toPerson, R.to == "person")
 	K.setSeg(w.toAll, R.to == "all")
 	local list = persons()
-	local can, on = 0, 0
+	local can, on, found, onlyCan = 0, 0, false, nil
 	for _, p in ipairs(list) do
-		if p.can then can = can + 1 end
+		if p.can then can = can + 1; onlyCan = p.name end
 		if p.online then on = on + 1 end
+		if p.name == R.person then found = true end
+	end
+	-- Auswahl passt nicht mehr (anderes Rezept): verwerfen; nur eine sinnvolle Person: vorauswaehlen
+	if R.person and not found then R.person = nil end
+	if not R.person then
+		if #list == 1 then R.person = list[1].name
+		elseif can == 1 then R.person = onlyCan end
 	end
 	if R.to == "person" then
 		w.personList.frame:Show()
@@ -801,14 +986,19 @@ local function refreshOrderForm()
 			w.allInfo:SetText(T("Wähle zuerst ein Rezept.", "Select a recipe first."))
 		end
 	end
-	-- Material
+	-- Material (mitgeliefert geht nur an eine bestimmte Person)
 	K.setSeg(w.matSelf, R.mats == "self")
 	K.setSeg(w.matCr, R.mats == "crafter")
 	if R.rec then
 		local r = {}
 		for _, e in ipairs(R.rec.r) do r[#r + 1] = { e[1], e[2] * R.qty } end
 		local raw = K.RawFresh({ r = r, out = 0 })
-		local lines = { string.format(T("Rohstoffe für %d× %s:", "Raw materials for %d× %s:"), R.qty, ns.RecipeName(R.rid, R.rec)) }
+		local lines = {}
+		if R.mats == "self" then
+			lines[1] = "|cff9a8f7e" .. T("Mit Material: Der Auftrag wird erst gesendet, wenn die Rohstoffe verschickt sind.",
+				"With materials: the order is only sent once the materials are mailed.") .. "|r"
+		end
+		lines[#lines + 1] = string.format(T("Rohstoffe für %d× %s:", "Raw materials for %d× %s:"), R.qty, ns.RecipeName(R.rid, R.rec))
 		for _, e in ipairs(raw) do
 			local have = ns.ItemCount(e[1], true)
 			local line = K.itemText(e[1], e[2])
@@ -824,10 +1014,12 @@ local function refreshOrderForm()
 	end
 end
 
+local ORDER_W = 380
+
 local function buildOrderWindow()
 	local f = K.Box(UIParent, K.COL.bg, K.COL.border)
 	winOrder = f
-	f:SetSize(440, 520)
+	f:SetSize(ORDER_W, 520)
 	f:SetPoint("CENTER", -200, 20)
 	f:SetFrameStrata("DIALOG")
 	f:SetMovable(true)
@@ -851,7 +1043,7 @@ local function buildOrderWindow()
 	Lbl(f, T("Rezept", "Recipe"), -34)
 	local rb = K.Box(f, K.COL.panel, K.COL.border2)
 	rb:SetPoint("TOPLEFT", 12, -48)
-	rb:SetSize(416, 32)
+	rb:SetSize(ORDER_W - 24, 32)
 	f.recIcon = rb:CreateTexture(nil, "ARTWORK")
 	f.recIcon:SetSize(24, 24)
 	f.recIcon:SetPoint("LEFT", 6, 0)
@@ -864,7 +1056,7 @@ local function buildOrderWindow()
 	f.recProf:SetWidth(300)
 
 	local results
-	local search = EditBoxIn(f, 416, 22, function(self)
+	local search = EditBoxIn(f, ORDER_W - 24, 22, function(self)
 		local q = strtrim(self:GetText())
 		if q == "" then results.frame:Hide() return end
 		results.frame:Show()
@@ -877,7 +1069,7 @@ local function buildOrderWindow()
 	search.edit:HookScript("OnTextChanged", function(self) ph:SetShown(self:GetText() == "") end)
 	f.search = search
 
-	results = MiniList(f, 6, 20, 416, function(r, it)
+	results = MiniList(f, 6, 20, ORDER_W - 24, function(r, it)
 		r.bg:SetColorTexture(K.COL.panel[1], K.COL.panel[2], K.COL.panel[3], 1)
 		r.t1:SetText(it.name)
 		r.t2:SetText(it.pname)
@@ -913,11 +1105,11 @@ local function buildOrderWindow()
 
 	-- Empfaenger
 	Lbl(f, T("Empfänger", "Recipient"), -160)
-	f.toPerson = K.Btn(f, T("Bestimmte Person", "Specific person"), 130, 20, function() R.to = "person"; refreshOrderForm() end, 11)
+	f.toPerson = K.Btn(f, T("Direkt bestellen bei …", "Order directly from …"), 150, 20, function() R.to = "person"; refreshOrderForm() end, 11)
 	f.toPerson:SetPoint("TOPLEFT", 12, -174)
-	f.toAll = K.Btn(f, T("Alle im Beruf", "Everyone in profession"), 130, 20, function() R.to = "all"; refreshOrderForm() end, 11)
+	f.toAll = K.Btn(f, T("Alle im Beruf", "Everyone in profession"), 130, 20, function() R.to, R.mats = "all", "crafter"; refreshOrderForm() end, 11)
 	f.toAll:SetPoint("LEFT", f.toPerson, "RIGHT", -1, 0)
-	f.personList = MiniList(f, 4, 22, 416, function(r, it)
+	f.personList = MiniList(f, 4, 22, ORDER_W - 24, function(r, it)
 		local sel = (R.person == it.name)
 		r.bg:SetColorTexture(sel and 0.29 or 0.141, sel and 0.239 or 0.118, sel and 0.071 or 0.09, 1)
 		local dot = it.online and "|cff4fd05a●|r " or ""
@@ -930,45 +1122,29 @@ local function buildOrderWindow()
 	f.personList.frame:SetPoint("TOPLEFT", 12, -198)
 	f.allInfo = K.FS(f, 11, K.COL.muted)
 	f.allInfo:SetPoint("TOPLEFT", 12, -200)
-	f.allInfo:SetWidth(416)
+	f.allInfo:SetWidth(ORDER_W - 24)
 	f.allInfo:SetHeight(70)
 	f.allInfo:SetWordWrap(true)
 	f.allInfo:SetJustifyV("TOP")
 
 	-- Material
 	Lbl(f, T("Material", "Materials"), -296)
-	f.matSelf = K.Btn(f, T("Ich liefere es", "I provide it"), 130, 20, function() R.mats = "self"; refreshOrderForm() end, 11)
+	f.matSelf = K.Btn(f, T("Ich liefere es", "I provide it"), 130, 20, function() R.mats, R.to = "self", "person"; refreshOrderForm() end, 11)
 	f.matSelf:SetPoint("TOPLEFT", 12, -310)
 	f.matCr = K.Btn(f, T("Hersteller besorgt es", "Crafter gets it"), 140, 20, function() R.mats = "crafter"; refreshOrderForm() end, 11)
 	f.matCr:SetPoint("LEFT", f.matSelf, "RIGHT", -1, 0)
 	f.needs = K.FS(f, 11, K.COL.text)
 	f.needs:SetPoint("TOPLEFT", 12, -336)
-	f.needs:SetWidth(416)
+	f.needs:SetWidth(ORDER_W - 24)
 	f.needs:SetHeight(98)
-	f.needs:SetWordWrap(false)
+	f.needs:SetWordWrap(true) -- ohne das zeigt das Spiel nur die erste Zeile
 	f.needs:SetJustifyV("TOP")
 	f.needs:SetSpacing(2)
 
-	-- Trinkgeld und Notiz
-	Lbl(f, T("Trinkgeld", "Tip"), -440)
-	local function coinBox(x, w, letters, tag, color)
-		local b = EditBoxIn(f, w, 22)
-		b:SetPoint("TOPLEFT", x, -454)
-		b.edit:SetNumeric(true)
-		b.edit:SetMaxLetters(letters)
-		local l = K.FS(f, 12, color)
-		l:SetPoint("LEFT", b, "RIGHT", 3, 0)
-		l:SetText(tag)
-		return b
-	end
-	f.tipG = coinBox(12, 54, 6, "g", { 1, 0.82, 0.2 })
-	f.tipS = coinBox(80, 32, 2, "s", { 0.78, 0.78, 0.82 })
-	f.tipC = coinBox(126, 32, 2, "k", { 0.85, 0.5, 0.3 })
-	local nl = Lbl(f, T("Notiz (optional)", "Note (optional)"), -440)
-	nl:ClearAllPoints()
-	nl:SetPoint("TOPLEFT", 180, -440)
-	f.note = EditBoxIn(f, 248, 22)
-	f.note:SetPoint("TOPLEFT", 180, -454)
+	-- Notiz
+	Lbl(f, T("Notiz (optional)", "Note (optional)"), -440)
+	f.note = EditBoxIn(f, ORDER_W - 24, 22)
+	f.note:SetPoint("TOPLEFT", 12, -454)
 	f.note.edit:SetMaxLetters(40)
 
 	local cancel = K.Btn(f, T("Abbrechen", "Cancel"), 100, 24, function() f:Hide() end)
@@ -980,26 +1156,58 @@ local function buildOrderWindow()
 			if not R.person then ns.Print(T("Bitte einen Empfänger wählen.", "Please select a recipient.")) return end
 			to = R.person
 		end
-		O.Create({ key = R.key, pname = R.pname, rid = R.rid, rec = R.rec, qty = R.qty, to = to, mats = R.mats,
-			tip = (tonumber(f.tipG.edit:GetText()) or 0) * 10000 + math.min(99, tonumber(f.tipS.edit:GetText()) or 0) * 100 + math.min(99, tonumber(f.tipC.edit:GetText()) or 0), note = strtrim(f.note.edit:GetText()) })
+		if R.mats == "self" then
+			local can
+			for _, p in ipairs(persons()) do
+				if p.name == R.person then can = p.can end
+			end
+			if to == "*" or not can then
+				ns.Print(T("Mit Material bitte eine Person wählen, die das Rezept kennt.",
+					"With materials, please choose a person who knows the recipe."))
+				return
+			end
+		end
+		local o = O.Create({ key = R.key, pname = R.pname, rid = R.rid, rec = R.rec, qty = R.qty, to = to, mats = R.mats,
+			note = strtrim(f.note.edit:GetText()) })
 		f:Hide()
-		ns.Print(T("Bestellung gesendet an ", "Order sent to ") .. (to == "*" and (T("alle im Beruf ", "everyone in ") .. (R.pname or "")) or to))
+		if R.mats == "self" then
+			ns.Print(T("Auftrag vorbereitet. Er geht an ", "Order prepared. It is sent to ") .. to ..
+				T(", sobald das Material verschickt ist.", " once the materials are mailed."))
+			if O.OpenTask then O.OpenTask(o.id) end
+			-- steht man schon am Briefkasten, wird die Post gleich vorbereitet
+			if ns.Mail then ns.Mail.PrepareOrder(o.id) end
+		else
+			ns.Print(T("Bestellung gesendet an ", "Order sent to ") .. (to == "*" and (T("alle im Beruf ", "everyone in ") .. (R.pname or "")) or to))
+		end
 	end)
 	send:SetPoint("BOTTOMRIGHT", -12, 10)
 end
 
+-- Auswahl in der Hauptliste ins offene Bestellfenster uebernehmen (Menge, Material und Notiz bleiben)
+function O.SelectionChanged()
+	if not (winOrder and winOrder:IsShown()) then return end
+	local key, rid = ns.UI.GetSelection()
+	if not (key and rid) or (R.key == key and R.rid == rid) then return end
+	local rec, pname = foundRecipe(key, rid)
+	if not rec then return end
+	R.key, R.rid, R.rec, R.pname = key, rid, rec, pname
+	winOrder.search.edit:SetText("")
+	winOrder.search.edit:ClearFocus()
+	refreshOrderForm()
+end
+
 function O.OpenOrder()
 	K = K or ns.UIK
-	if not winOrder then buildOrderWindow() end
+	if not winOrder then
+		buildOrderWindow()
+		ns.UI.Dockable(winOrder)
+	end
 	local key, rid = ns.UI.GetSelection()
 	R = { qty = 1, to = "person", mats = "self" }
 	if key and rid then
 		local rec, pname = foundRecipe(key, rid)
 		if rec then R.key, R.rid, R.rec, R.pname = key, rid, rec, pname end
 	end
-	winOrder.tipG.edit:SetText("")
-	winOrder.tipS.edit:SetText("")
-	winOrder.tipC.edit:SetText("")
 	winOrder.note.edit:SetText("")
 	winOrder.search.edit:SetText("")
 	winOrder:Show()
@@ -1008,6 +1216,8 @@ end
 
 -- ---------------------------------------------------------------- Fenster: Offene Auftraege
 local LROWS, LROW_H = 6, 56
+local LIST_W = 560
+local LROW_W = LIST_W - 32
 
 local function paintOrderRow(row, o)
 	local inc = (o.from ~= me())
@@ -1018,8 +1228,7 @@ local function paintOrderRow(row, o)
 	elseif inc then target = T("direkt an dich", "directly to you")
 	else target = T("an ", "to ") .. o.to end
 	local sub = (inc and (T("von ", "from ") .. o.from .. " · ") or "") .. target .. " · " ..
-		(o.mats == "self" and T("Material wird gestellt", "materials provided") or T("Hersteller besorgt Material", "crafter gets materials")) ..
-		((o.tip or 0) > 0 and (" · " .. T("Trinkgeld ", "tip ") .. ns.Prices.Money(o.tip)) or "") ..
+		(o.mats == "self" and T("mit Material", "with materials") or T("Material vom Hersteller", "materials from crafter")) ..
 		((o.note or "") ~= "" and (" · „" .. o.note .. "“") or "")
 	row.sub:SetText(sub)
 	local parts = {}
@@ -1035,8 +1244,9 @@ local function paintOrderRow(row, o)
 			local can = O.CanCraft(o)
 			if not can then chip, chipC = T("Rezept noch unbekannt", "recipe not known yet"), { 0.91, 0.66, 0.42 } end
 			B(T("Annehmen", "Accept"), function() O.Accept(o) end, can)
-			B(T("Ignorieren", "Ignore"), function() O.Ignore(o) end)
+			B(T("Abbrechen", "Cancel"), function() O.Decline(o) end)
 		elseif o.st == "pending" then
+			B(T("Zurücknehmen", "Take back"), function() O.Unaccept(o) end)
 			chip, chipC = T("wartet auf Bestätigung …", "waiting for confirmation …"), COL.gold
 		elseif o.by == me() then
 			accent = COL.green
@@ -1049,8 +1259,15 @@ local function paintOrderRow(row, o)
 			chip = T("übernommen von ", "taken by ") .. (o.by or "?")
 		end
 	else
-		if o.st ~= "taken" then
+		if o.st == "declined" then
+			accent = COL.red
+			chip, chipC = T("abgebrochen von ", "cancelled by ") .. (o.declinedBy or o.to), COL.red
+			B(T("Entfernen", "Remove"), function() O.Remove(o) end)
+		elseif o.st ~= "taken" then
 			chip, chipC = (o.to == "*") and T("wartet auf Hersteller", "waiting for a crafter") or (T("wartet auf ", "waiting for ") .. o.to), COL.gold
+			local n = 0
+			for _ in pairs(o.declined or {}) do n = n + 1 end
+			if n > 0 then chip = chip .. " · " .. n .. T(" abgelehnt", " declined") end
 			B(T("Zurückziehen", "Withdraw"), function() O.Withdraw(o) end)
 		else
 			accent = COL.green
@@ -1077,6 +1294,12 @@ local function paintOrderRow(row, o)
 			b:Hide()
 		end
 	end
+	-- Texte nutzen den Platz bis zum Status bzw. zu den Knoepfen
+	local left = 12 + 28 + 8
+	row.title:SetWidth(math.max(80, LROW_W - left - math.ceil(row.chip:GetStringWidth()) - 20))
+	local bw = (#acts > 0) and (#acts * 82 + 8) or 0
+	row.sub:SetWidth(math.max(80, LROW_W - left - bw - 10))
+	row.raw:SetWidth(math.max(80, LROW_W - left - bw - 10))
 	row:SetAlpha((inc and o.st == "taken" and o.by ~= me()) and 0.65 or 1)
 end
 
@@ -1088,6 +1311,7 @@ local function renderList()
 	K.setSeg(w.tabMine, openTab == "mine")
 	w.tabIn.label:SetText(T("Eingehend (", "Incoming (") .. inN .. ")")
 	w.tabOut.label:SetText(T("Meine Bestellungen (", "My orders (") .. outN .. ")")
+	for _, b in ipairs({ w.tabIn, w.tabMine, w.tabOut }) do b:SetWidth(math.ceil(b.label:GetStringWidth()) + 18) end
 	K.setSeg(w.tabIn, openTab == "in")
 	K.setSeg(w.tabOut, openTab == "out")
 	w.chk:SetShown(openTab == "in")
@@ -1124,7 +1348,7 @@ local function buildListWindow()
 	local f = K.Box(UIParent, K.COL.bg, K.COL.border)
 	winList = f
 	f.offset = 0
-	f:SetSize(640, 470)
+	f:SetSize(LIST_W, 470)
 	f:SetPoint("CENTER", 220, 20)
 	f:SetFrameStrata("DIALOG")
 	f:SetMovable(true)
@@ -1153,16 +1377,18 @@ local function buildListWindow()
 
 	f.chk = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
 	f.chk:SetSize(22, 22)
-	f.chk:SetPoint("TOPRIGHT", -190, -34)
+	f.chk:SetPoint("TOPRIGHT", -130, -34)
 	f.chk:SetScript("OnClick", function(self) onlyCraft = self:GetChecked() and true or false; f.offset = 0; renderList() end)
 	f.chkText = K.FS(f, 11, K.COL.muted)
 	f.chkText:SetPoint("LEFT", f.chk, "RIGHT", 0, 0)
-	f.chkText:SetText(T("Nur, was ich herstellen kann", "Only what I can craft"))
+	f.chkText:SetText(T("Nur herstellbare", "Only craftable"))
+	f.chk:ClearAllPoints()
+	f.chk:SetPoint("TOPRIGHT", -(14 + math.ceil(f.chkText:GetStringWidth())), -34)
 
 	f.rows = {}
 	for i = 1, LROWS do
 		local row = CreateFrame("Frame", nil, f)
-		row:SetSize(600, LROW_H)
+		row:SetSize(LROW_W, LROW_H)
 		row:SetPoint("TOPLEFT", 12, -64 - (i - 1) * LROW_H)
 		row.bg = row:CreateTexture(nil, "BACKGROUND")
 		row.bg:SetPoint("TOPLEFT", 0, -1)
@@ -1187,7 +1413,7 @@ local function buildListWindow()
 		row.raw:SetWidth(300)
 		row.chip = K.FS(row, 11, K.COL.muted, "RIGHT")
 		row.chip:SetPoint("TOPRIGHT", -8, -8)
-		row.chip:SetWidth(200)
+		row.chip:SetWidth(0)
 		row.btns = {}
 		for j = 3, 1, -1 do
 			local b = K.Btn(row, "", 78, 18, function(self) if self.fn then self.fn() end end, 11)
@@ -1203,7 +1429,6 @@ local function buildListWindow()
 			GameTooltip:AddLine(o.qty .. "× " .. O.Name(o), 1, 1, 1)
 			GameTooltip:AddLine(T("von ", "from ") .. o.from, 0.8, 0.8, 0.8)
 			GameTooltip:AddLine((o.to == "*") and (T("an alle im Beruf ", "to everyone in ") .. (o.pname or "")) or (T("an ", "to ") .. o.to), 0.8, 0.8, 0.8)
-			if (o.tip or 0) > 0 then GameTooltip:AddLine(T("Trinkgeld: ", "Tip: ") .. ns.Prices.Money(o.tip), 1, 0.82, 0) end
 			if (o.note or "") ~= "" then GameTooltip:AddLine("„" .. o.note .. "“", 0.9, 0.9, 0.9, true) end
 			GameTooltip:AddLine(" ")
 			GameTooltip:AddLine(T("Rohstoffe:", "Raw materials:"), 1, 0.82, 0)
@@ -1235,9 +1460,17 @@ function O.OpenList(tab)
 		if winList then winList.offset = 0 end
 	end
 	K = K or ns.UIK
-	if not winList then buildListWindow() end
+	if not winList then
+		buildListWindow()
+		ns.UI.Dockable(winList)
+	end
 	winList:Show()
+	winList:Raise() -- ueber das Hauptfenster
 	renderList()
+end
+
+function O.CloseList()
+	if winList then winList:Hide() end
 end
 
 -- Knopf-Verhalten: erster Klick oeffnet, zweiter schliesst
@@ -1262,14 +1495,14 @@ local function confirm(text, fn)
 end
 
 function O.ConfirmWithdraw(o)
-	if not (o.ms or o.mr or o.paid or (o.cr or 0) > 0 or o.sh) then return O.Withdraw(o) end
+	if not (o.ms or o.mr or o.sentM or (o.cr or 0) > 0 or o.sh) then return O.Withdraw(o) end
 	confirm(T("Bei diesem Auftrag wurde schon Material verschickt oder hergestellt. Wirklich zurückziehen?",
 		"Materials were already sent or items crafted for this order. Really withdraw it?"),
 		function() if db()[o.id] == o then O.Withdraw(o) end end)
 end
 
 function O.ConfirmRelease(o)
-	if not (o.ms or o.mr or o.paid or (o.cr or 0) > 0 or o.sh) then return O.Release(o) end
+	if not (o.ms or o.mr or (o.cr or 0) > 0 or o.sh) then return O.Release(o) end
 	confirm(T("Bei diesem Auftrag wurde schon Material verschickt oder hergestellt. Wirklich zurückgeben?",
 		"Materials were already sent or items crafted for this order. Really give it back?"),
 		function() if db()[o.id] == o then O.Release(o) end end)

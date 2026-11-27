@@ -6,7 +6,7 @@ local UI = {}
 ns.UI = UI
 local T = ns.T
 
-local DEF_W, DEF_H, MIN_W, MIN_H = 800, 800, 800, 800
+local DEF_W, DEF_H, MIN_W, MIN_H = 700, 800, 680, 800
 local TOP_H, BOT_H, BAR_H = 88, 150, 34
 local ROW_H, ROWS = 24, 18       -- Rezeptliste (ROWS und ROW_W passen sich der Fenstergroesse an)
 local MROW_H, MROWS = 26, 4      -- Mitgliederliste unten
@@ -94,6 +94,8 @@ local items, bitems = {}, {}
 local offset, boffset = 0, 0
 local dirty = false
 local S = { selKey = nil, selRec = nil }
+local relayoutDocks -- weiter unten definiert
+local folded = false -- Hauptfenster bis auf die Kopfleiste eingeklappt (nur bis zum Schliessen)
 local W = {}
 local producers, usedAsReagent, rawCache = {}, {}, {}
 
@@ -248,8 +250,8 @@ end
 
 local function expand(itemID, qty, acc, order, depth)
 	local prod = producers[itemID]
-	-- Fetzen-Option aus: Rezepte aus Verdorbenen Lederfetzen werden nicht weiter aufgeloest
-	if prod and ns.Prices and not ns.Prices.Settings().scraps and ns.Prices.UsesScraps(prod) then prod = nil end
+	-- Verdorbene Lederfetzen gehoeren nur ins Rezept "Leichtes Leder" selbst: Rezepte daraus werden nicht weiter aufgeloest
+	if prod and ns.Prices and ns.Prices.UsesScraps(prod) then prod = nil end
 	-- Ist Kaufen guenstiger als Herstellen (laut Preisdaten), wird nicht weiter aufgeloest
 	if prod and ns.Prices then
 		local u = ns.Prices.Unit(itemID)
@@ -317,6 +319,57 @@ local function treeLines(e)
 		out[#out + 1] = { t = "tl", left = itemText(d[1], d[2]) .. "  " .. hc .. "(" .. have .. ")|r", raw = table.concat(parts, ", "), id = d[1], rawIds = order }
 	end
 	return out
+end
+
+-- Stufenvoraussetzung und Gegenstandsstufe des Ergebnisses (0: keine, nil: Daten noch nicht geladen)
+local levels = {}
+local function requiredLevel(id)
+	if not id or id <= 0 then return 0, 0 end
+	local lv = levels[id]
+	if lv then return lv[1], lv[2] end
+	local get = (C_Item and C_Item.GetItemInfo) or GetItemInfo
+	local name, _, _, itemLevel, minLevel = get(id)
+	if not name then return nil end -- das Spiel meldet sich, sobald die Daten da sind
+	levels[id] = { minLevel or 0, itemLevel or 0 }
+	return levels[id][1], levels[id][2]
+end
+
+-- Umlaute wie die Grundbuchstaben einsortieren
+local FOLD = { ["Ä"] = "a", ["Ö"] = "o", ["Ü"] = "u", ["ä"] = "a", ["ö"] = "o", ["ü"] = "u", ["ß"] = "ss" }
+local function sortName(n)
+	-- UTF-8: die Umlaute und das scharfe s beginnen mit Byte 195
+	return (n:gsub("\195[\128-\191]", FOLD):lower())
+end
+
+-- Reihenfolge in einer Kategorie: Schwierigkeit (orange, gelb, gruen, grau, unbekannt), benoetigte Stufe,
+-- Gegenstandsstufe, Materialmenge, Name. Bei grauen Rezepten umgekehrt: die kleinsten Anforderungen stehen unten.
+local function materialCount(rec)
+	local n = 0
+	for _, r in ipairs(rec.r) do n = n + r[2] end
+	return n
+end
+
+local function recipeLess(a, b)
+	local da, db = a.diff or 4, b.diff or 4
+	if da ~= db then return da < db end
+	local gray = (da == 3)
+	local la, ia = requiredLevel(a.rec.out)
+	local lb, ib = requiredLevel(b.rec.out)
+	-- noch unbekannte Stufen stehen in beiden Richtungen am Ende
+	local unknown = gray and -1 or 999
+	for _, k in ipairs({
+		{ la or unknown, lb or unknown },
+		{ ia or unknown, ib or unknown },
+		{ materialCount(a.rec), materialCount(b.rec) },
+	}) do
+		if k[1] ~= k[2] then
+			if gray then return k[1] > k[2] end
+			return k[1] < k[2]
+		end
+	end
+	local na, nb = sortName(a.name), sortName(b.name)
+	if na ~= nb then return na < nb end
+	return a.id < b.id
 end
 
 local function buildItems()
@@ -421,7 +474,7 @@ local function buildItems()
 				end)
 				for _, ck in ipairs(catKeys) do
 					local list = byCat[ck]
-					table.sort(list, function(a, b) return a.name < b.name end)
+					table.sort(list, recipeLess)
 					local full = key .. "/" .. ck
 					local collapsed = u.catCollapsed[full]
 					out[#out + 1] = { t = "cat", ck = full, name = ck, n = #list, collapsed = collapsed }
@@ -537,10 +590,11 @@ function UI.ApplyScale()
 		local es = (S.fitScale or 1) * us
 		frame:SetScale(es)
 		if frame.SetResizeBounds then
-			frame:SetResizeBounds(MIN_W, MIN_H, math.floor(UIParent:GetWidth() / es), math.floor(UIParent:GetHeight() / es))
+			local minH = folded and (TOP_H + 20) or MIN_H
+			frame:SetResizeBounds(MIN_W, minH, math.floor(UIParent:GetWidth() / es), math.floor(UIParent:GetHeight() / es))
 		end
 	end
-	for _, n in ipairs({ "CraftSharePriceCheck", "CraftShareOrderFrame", "CraftShareOrdersFrame", "CraftShareTaskFrame", "CraftShareMailFrame" }) do
+	for _, n in ipairs({ "CraftSharePriceCheck", "CraftShareOrderFrame", "CraftShareOrdersFrame", "CraftShareTaskFrame", "CraftShareMailFrame", "CraftShareHistoryFrame" }) do
 		local g = _G[n]
 		if g then g:SetScale(us) end
 	end
@@ -790,6 +844,10 @@ local function renderStatus()
 	local g = ns.Roster.GuildName()
 	local base = string.format(T("%d Mitglieder · %d online", "%d members · %d online"), n, online)
 	W.sub:SetText(g and ("<" .. g .. ">  ·  " .. base) or base)
+	-- Hinweis nur, wenn jemand eine neuere Version nutzt
+	local nv = ns.NewerVersion()
+	W.verBox:SetShown(nv ~= nil)
+	if nv then W.verText:SetText(T("Neue Version ", "New version ") .. nv.v .. T(" verfügbar", " available")) end
 	if W.sub:GetStringWidth() > (W.sub:GetWidth() or 0) then W.sub:SetText(base) end
 	W.auto.label:SetText(ns.db.autoSync and T("Auto-Sync: an", "Auto sync: on") or T("Auto-Sync: aus", "Auto sync: off"))
 	-- Preis-Optionen
@@ -797,14 +855,9 @@ local function renderStatus()
 	W.srcBtn.label:SetText(T("Preisquelle: ", "Price source: ") .. P.SourceLabel(P.Settings().source))
 	W.ptBtn.label:SetText(T("Preisart: ", "Price type: ") .. (P.Settings().ptype == "market" and T("Marktwert (TSM)", "Market value (TSM)") or T("Mindestgebot (Auktion)", "Minimum buyout")))
 	for _, c in ipairs(W.chks) do c:SetChecked(P.Settings()[c.key] and true or false) end
-	W.scanTxt:SetText(P.ScanText())
-	W.scanBtn.label:SetText(P.scanning and T("Scan abbrechen", "Cancel scan") or T("AH scannen", "Scan AH"))
-	local leather = P.HasLeatherworking()
-	W.leatherHead:SetShown(leather)
-	W.scrapChk:SetShown(leather)
-	W.scrapTxt:SetShown(leather)
-	W.scrapChk:SetChecked(P.Settings().scraps and true or false)
-	W.opts:SetHeight(leather and 372 or 322)
+	W.priceInfo:SetText(P.NewestText())
+	if W.autoMailChk then W.autoMailChk:SetChecked(ns.db.autoMail ~= false) end
+	if W.soundBtn and ns.Mini then W.soundBtn.label:SetText(T("Ton neuer Auftrag: ", "New order sound: ") .. ns.Mini.SoundName()) end
 	if W.skillChk then W.skillChk:SetChecked(cfg().skillOnly and true or false) end
 	if W.scaleVal then W.scaleVal:SetText(math.floor(UI.UserScale() * 100 + 0.5) .. "%") end
 	-- Hinweis auf neue Auftraege direkt am Knopf
@@ -868,6 +921,8 @@ local function onRowClick(row, btn)
 			S.selKey, S.selRec = nil, nil
 		else
 			S.selKey, S.selRec = it.key, it.id
+			-- offenes Bestellfenster uebernimmt die neue Auswahl
+			if ns.Orders and ns.Orders.SelectionChanged then ns.Orders.SelectionChanged() end
 		end
 		boffset = 0
 	elseif it.t == "tl" then
@@ -1073,7 +1128,7 @@ end
 
 -- Passt Zeilenzahl, Spaltenbreiten und Bereiche an die aktuelle Fenstergroesse an.
 local function layout()
-	if not frame or not mid then return end
+	if not frame or not mid or folded then return end
 	local w, h = frame:GetWidth(), frame:GetHeight()
 	ROW_W = math.floor(w - 20 - 6 - 24)
 	local midH = h - 20 - 24 - TOP_H - BAR_H - BOT_H
@@ -1106,7 +1161,46 @@ local function layout()
 		r.profsFS:SetPoint("LEFT", r, "RIGHT", px, 0)
 		r.profsFS:SetWidth(pw)
 	end
-	W.sub:SetWidth(math.max(60, w - 20 - 12 - 150 - 380))
+	-- Platz zwischen Titel und Suchfeld (Suche, Optionen, Einklappen, X brauchen rechts 364)
+	W.sub:SetWidth(math.max(60, (w - 20) - 364 - 20 - math.ceil(W.title and W.title:GetStringWidth() or 140)))
+end
+
+-- Eingeklappt ist nur die Kopfleiste zu sehen; die Oberkante bleibt dabei an ihrem Platz
+local function applyCollapsed()
+	if not frame or not W.bar then return end
+	local u = cfg()
+	local collapsed = folded
+	local es = (S.fitScale or 1) * UI.UserScale()
+	local maxW, maxH = math.floor(UIParent:GetWidth() / es), math.floor(UIParent:GetHeight() / es)
+	local height = collapsed and (TOP_H + 20) or math.max(MIN_H, (u.size and u.size[2]) or DEF_H)
+	local width = math.max(MIN_W, (u.size and u.size[1]) or DEF_W)
+	local left, top = frame:GetLeft(), frame:GetTop()
+
+	-- Pfeil nach unten: ausklappen, nach oben: einklappen
+	if collapsed then W.collapseBtn.arrow:SetTexCoord(0, 1, 0, 1) else W.collapseBtn.arrow:SetTexCoord(0, 1, 1, 0) end
+	mid:SetShown(not collapsed)
+	bot:SetShown(not collapsed)
+	W.bar:SetShown(not collapsed)
+	W.grip:SetShown(not collapsed)
+	-- zuerst die Grenzen lockern, dann die Groesse setzen
+	if frame.SetResizeBounds then pcall(frame.SetResizeBounds, frame, MIN_W, TOP_H + 20, maxW, math.max(maxH, height)) end
+	frame:SetSize(width, height)
+	if left and top then
+		frame:ClearAllPoints()
+		frame:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", left, top)
+		u.pos = { "TOPLEFT", "BOTTOMLEFT", left, top }
+	end
+	if not collapsed then
+		if frame.SetResizeBounds then pcall(frame.SetResizeBounds, frame, MIN_W, MIN_H, maxW, math.max(maxH, height)) end
+		layout()
+		UI.Refresh()
+	end
+end
+
+-- Fehler sichtbar machen (Lua-Fehler sind im Spiel oft ausgeblendet)
+local function safeCollapse()
+	local ok, err = pcall(applyCollapsed)
+	if not ok then ns.Print("Einklappen: " .. tostring(err)) end
 end
 
 local function build()
@@ -1114,14 +1208,19 @@ local function build()
 	local f = Box(UIParent, COL.bg, COL.border)
 	frame = f
 	f:Hide()
+	-- bisherige Standardbreite (800) auf die neue, schmalere umstellen
+	if u.size and u.size[1] == 800 then u.size[1] = DEF_W end
 	local sz = u.size or { DEF_W, DEF_H }
 	f:SetSize(math.max(MIN_W, sz[1] or DEF_W), math.max(MIN_H, sz[2] or DEF_H))
-	f:SetFrameStrata("HIGH")
+	-- gleiche Ebene wie die Zusatzfenster: angeklickt oder verschoben kommt es nach vorn
+	f:SetFrameStrata("DIALOG")
+	f:SetToplevel(true)
 	f:SetMovable(true)
 	f:EnableMouse(true)
 	f:SetClampedToScreen(true)
 	f:RegisterForDrag("LeftButton")
-	f:SetScript("OnDragStart", f.StartMoving)
+	f:SetScript("OnDragStart", function(self) self:Raise(); self:StartMoving() end)
+	f:SetScript("OnMouseDown", function(self) self:Raise() end)
 	f:SetScript("OnDragStop", function(self)
 		self:StopMovingOrSizing()
 		local p, _, rp, x, y = self:GetPoint()
@@ -1153,6 +1252,7 @@ local function build()
 	local title = FS(top, 18, COL.gold)
 	title:SetPoint("TOPLEFT", 10, -8)
 	title:SetText(T("Gildenberufe", "Guild professions"))
+	W.title = title
 	W.sub = FS(top, 12, COL.muted)
 	W.sub:SetPoint("LEFT", title, "RIGHT", 10, -1)
 	W.sub:SetWidth(200)
@@ -1165,11 +1265,32 @@ local function build()
 	local optBtn = Btn(top, T("Optionen", "Options"), 74, 22, function()
 		W.opts:SetShown(not W.opts:IsShown())
 	end)
-	optBtn:SetPoint("TOPRIGHT", -38, -6)
+	optBtn:SetPoint("TOPRIGHT", -64, -6)
+	-- Einklappen: zwischen Optionen und X
+	W.collapseBtn = Btn(top, "", 22, 22, function()
+		folded = not folded
+		W.opts:Hide()
+		GameTooltip:Hide()
+		safeCollapse()
+	end)
+	W.collapseBtn:SetPoint("TOPRIGHT", -38, -6)
+	W.collapseBtn.arrow = W.collapseBtn:CreateTexture(nil, "OVERLAY")
+	W.collapseBtn.arrow:SetSize(16, 16)
+	W.collapseBtn.arrow:SetPoint("CENTER", 0, 0)
+	W.collapseBtn.arrow:SetTexture("Interface\\AddOns\\CraftShare\\Media\\Chevron")
+	W.collapseBtn.arrow:SetVertexColor(COL.gold[1], COL.gold[2], COL.gold[3])
+	W.collapseBtn.arrow:SetTexCoord(0, 1, 1, 0)
+	W.collapseBtn:SetScript("OnEnter", function(self)
+		GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+		GameTooltip:AddLine(folded and T("Fenster ausklappen", "Expand window")
+			or T("Bis auf die Kopfleiste einklappen", "Collapse to the header bar"), 1, 1, 1)
+		GameTooltip:Show()
+	end)
+	W.collapseBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 	W.opts = Box(f, COL.bg, COL.border)
-	W.opts:SetSize(340, 372)
+	W.opts:SetSize(340, 348)
 	W.opts:SetPoint("TOPRIGHT", optBtn, "BOTTOMRIGHT", 0, -2)
-	W.opts:SetFrameStrata("DIALOG")
+	W.opts:SetFrameStrata("FULLSCREEN_DIALOG") -- eine Ebene ueber dem Hauptfenster, sonst vermischen sich die Inhalte
 	-- Klicks und Mausrad nicht an die Fenster darunter durchlassen
 	W.opts:EnableMouse(true)
 	W.opts:EnableMouseWheel(true)
@@ -1182,6 +1303,9 @@ local function build()
 	end
 	local function priceChanged() UI.Refresh() end
 	optHead(T("Allgemein", "General"), -10)
+	local ver = FS(W.opts, 10, COL.muted, "RIGHT")
+	ver:SetPoint("TOPRIGHT", -12, -10)
+	ver:SetText("Guild CraftShare " .. T("Version ", "version ") .. ns.VERSION)
 	local sync = Btn(W.opts, "Sync", 150, 22, function() SlashCmdList["CRAFTSHARE"]("sync"); UI.Refresh() end)
 	sync:SetPoint("TOPLEFT", 12, -26)
 	W.auto = Btn(W.opts, "", 150, 22, function()
@@ -1202,7 +1326,7 @@ local function build()
 	minusB:SetPoint("RIGHT", W.scaleVal, "LEFT", -4, 0)
 	W.skillChk = CreateFrame("CheckButton", nil, W.opts, "UICheckButtonTemplate")
 	W.skillChk:SetSize(22, 22)
-	W.skillChk:SetPoint("TOPLEFT", 10, -84)
+	W.skillChk:SetPoint("TOPLEFT", 10, -230)
 	W.skillChk:SetScript("OnClick", function(self)
 		cfg().skillOnly = self:GetChecked() and true or false
 		offset = 0
@@ -1211,15 +1335,15 @@ local function build()
 	local skt = FS(W.opts, 11, COL.text)
 	skt:SetPoint("LEFT", W.skillChk, "RIGHT", 2, 0)
 	skt:SetText(T("Nur Rezepte mit Skillpunkten", "Only recipes that give skill points"))
-	optHead(T("Preise", "Prices"), -116)
+	optHead(T("Preise", "Prices"), -88)
 	W.srcBtn = Btn(W.opts, "", 316, 22, function() ns.Prices.CycleSource(); priceChanged() end)
-	W.srcBtn:SetPoint("TOPLEFT", 12, -132)
+	W.srcBtn:SetPoint("TOPLEFT", 12, -104)
 	W.ptBtn = Btn(W.opts, "", 316, 22, function()
 		local ps = ns.Prices.Settings()
 		ps.ptype = (ps.ptype == "market") and "min" or "market"
 		priceChanged()
 	end)
-	W.ptBtn:SetPoint("TOPLEFT", 12, -158)
+	W.ptBtn:SetPoint("TOPLEFT", 12, -130)
 	W.chks = {}
 	local function Chk(key, label, y)
 		local c = CreateFrame("CheckButton", nil, W.opts, "UICheckButtonTemplate")
@@ -1235,33 +1359,33 @@ local function build()
 		c.key = key
 		W.chks[#W.chks + 1] = c
 	end
-	Chk("vendor", T("Händlerpreise einbeziehen (günstigster gewinnt)", "Include vendor prices (cheapest wins)"), -186)
-	Chk("chain", T("Herstellungskette prüfen (Fetzen, Leder, …)", "Check crafting chain (scraps, leather, …)"), -210)
-	Chk("free", T("Vorhandene Materialien kostenlos rechnen", "Count owned materials as free"), -234)
-	W.scanTxt = FS(W.opts, 11, COL.muted)
-	W.scanTxt:SetPoint("TOPLEFT", 12, -268)
-	W.scanTxt:SetWidth(316)
-	W.scanBtn = Btn(W.opts, T("AH scannen", "Scan AH"), 150, 22, function() ns.Prices.StartScan(); UI.Refresh() end)
-	W.scanBtn:SetPoint("TOPLEFT", 12, -290)
-	-- Lederverarbeitung (nur sichtbar, wenn eine eigene Figur den Beruf hat)
-	W.leatherHead = FS(W.opts, 10, COL.goldDim)
-	W.leatherHead:SetPoint("TOPLEFT", 12, -324)
-	W.leatherHead:SetText(T("LEDERVERARBEITUNG", "LEATHERWORKING"))
-	W.scrapChk = CreateFrame("CheckButton", nil, W.opts, "UICheckButtonTemplate")
-	W.scrapChk:SetSize(22, 22)
-	W.scrapChk:SetPoint("TOPLEFT", 10, -338)
-	W.scrapChk:SetScript("OnClick", function(self)
-		ns.Prices.Settings().scraps = self:GetChecked() and true or false
-		priceChanged()
+	Chk("vendor", T("Händlerpreise einbeziehen (günstigster gewinnt)", "Include vendor prices (cheapest wins)"), -158)
+	Chk("chain", T("Herstellungskette prüfen (Leder, Barren, …)", "Check crafting chain (leather, bars, …)"), -182)
+	Chk("free", T("Vorhandene Materialien kostenlos rechnen", "Count owned materials as free"), -206)
+	-- Ton bei neuen Auftraegen: Klick wechselt und spielt ihn ab
+	W.soundBtn = Btn(W.opts, "", 316, 22, function(self)
+		ns.Mini.CycleSound()
+		self.label:SetText(T("Ton neuer Auftrag: ", "New order sound: ") .. ns.Mini.SoundName())
 	end)
-	W.scrapTxt = FS(W.opts, 11, COL.text)
-	W.scrapTxt:SetPoint("LEFT", W.scrapChk, "RIGHT", 2, 0)
-	W.scrapTxt:SetText(T("Verdorbene Lederfetzen zulassen", "Allow ruined leather scraps"))
-	f:HookScript("OnHide", function() W.opts:Hide() end)
+	W.soundBtn:SetPoint("BOTTOMLEFT", 12, 46)
+	-- ganz unten: Stand der Preisdaten
+	W.priceInfo = FS(W.opts, 11, COL.muted)
+	W.priceInfo:SetPoint("BOTTOMLEFT", 12, 10)
+	W.priceInfo:SetWidth(316)
+	W.priceInfo:SetWordWrap(true)
+	W.priceInfo:SetJustifyV("BOTTOM")
+	-- Post am Briefkasten selbst ausfuellen (Senden drueckt immer der Spieler)
+	W.autoMailChk = CreateFrame("CheckButton", nil, W.opts, "UICheckButtonTemplate")
+	W.autoMailChk:SetSize(22, 22)
+	W.autoMailChk:SetPoint("BOTTOMLEFT", 10, 72)
+	W.autoMailChk:SetScript("OnClick", function(self) ns.db.autoMail = self:GetChecked() and true or false end)
+	local amt = FS(W.opts, 11, COL.text)
+	amt:SetPoint("LEFT", W.autoMailChk, "RIGHT", 2, 0)
+	amt:SetText(T("Post automatisch vorbereiten", "Prepare mail automatically"))
 
 	local sbox = Box(top, COL.black, COL.border)
 	sbox:SetPoint("RIGHT", optBtn, "LEFT", -8, 0)
-	sbox:SetSize(250, 22)
+	sbox:SetSize(210, 22)
 	local clearBtn = Btn(sbox, "x", 16, 16, function()
 		searchBox:SetText("")
 		searchBox:ClearFocus()
@@ -1276,7 +1400,7 @@ local function build()
 	searchBox:SetTextColor(COL.text[1], COL.text[2], COL.text[3])
 	local ph = FS(sbox, 12, COL.muted)
 	ph:SetPoint("LEFT", 8, 0)
-	ph:SetWidth(216)
+	ph:SetWidth(196)
 	ph:SetJustifyH("LEFT")
 	ph:SetWordWrap(false)
 	ph:SetText(T("Rezept, Material oder Spieler …", "Recipe, material or player …"))
@@ -1336,8 +1460,28 @@ local function build()
 	-- Bestellen / Offene Auftraege (jeweils ein kleines Fenster)
 	W.openBtn = Btn(top, "", 140, 24, function() ns.Orders.ToggleList() end)
 	W.openBtn:SetPoint("TOPRIGHT", -10, -46)
+	-- Versionshinweis links neben "Auftraege"
+	W.verBox = CreateFrame("Frame", nil, top)
+	W.verBox:SetSize(260, 24)
+	W.verBox:SetPoint("RIGHT", W.openBtn, "LEFT", -12, 0)
+	W.verText = FS(W.verBox, 12, COL.orange, "RIGHT")
+	W.verText:SetPoint("RIGHT", 0, 0)
+	W.verText:SetWidth(260)
+	W.verBox:EnableMouse(true)
+	W.verBox:SetScript("OnEnter", function(self)
+		local nv = ns.NewerVersion()
+		if not nv then return end
+		GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+		GameTooltip:AddLine(string.format(T("%s nutzt Version %s, du hast %s.", "%s uses version %s, you have %s."),
+			nv.by or "?", nv.v, ns.VERSION), 1, 1, 1)
+		GameTooltip:AddLine(T("Download: ", "Download: ") .. ns.DOWNLOAD, 0.8, 0.8, 0.8)
+		GameTooltip:Show()
+	end)
+	W.verBox:SetScript("OnLeave", function() GameTooltip:Hide() end)
+	W.verBox:Hide()
 	-- Leiste zwischen Rezepten und Herstellern
 	local bar = Box(f, COL.panel, COL.border)
+	W.bar = bar
 	bar:SetHeight(BAR_H)
 	bar:SetPoint("BOTTOMLEFT", 10, 10 + BOT_H + 8)
 	bar:SetPoint("BOTTOMRIGHT", -10, 10 + BOT_H + 8)
@@ -1422,6 +1566,7 @@ local function build()
 
 	-- ---- Groesse ziehen: Ecke unten rechts (Minimum 800x800)
 	local grip = CreateFrame("Button", nil, f)
+	W.grip = grip
 	grip:SetSize(18, 18)
 	grip:SetPoint("BOTTOMRIGHT", -2, 2)
 	grip:SetFrameLevel(bot:GetFrameLevel() + 10)
@@ -1449,6 +1594,7 @@ local function build()
 
 	layout()
 	f:SetScript("OnSizeChanged", function()
+		if folded then return end
 		layout()
 		renderList()
 		renderBottom()
@@ -1466,7 +1612,110 @@ local function build()
 	end)
 	f:SetScript("OnHide", function()
 		if f.ticker then f.ticker:Cancel(); f.ticker = nil end
+		W.opts:Hide() -- beim naechsten Oeffnen ist das Optionenfenster zu
 	end)
+	f:HookScript("OnShow", function() relayoutDocks() end)
+	f:HookScript("OnSizeChanged", function() relayoutDocks() end)
+	-- beim Schliessen wieder ausklappen, damit das Fenster immer vollstaendig aufgeht
+	f:HookScript("OnHide", function()
+		if folded then
+			folded = false
+			safeCollapse()
+		end
+	end)
+end
+
+-- ---------------------------------------------------------------- Angedockte Fenster
+-- Auftragsliste, Bestellen, Auftrag und Preis Check haengen sich an das Hauptfenster: nebeneinander rechts davon,
+-- reicht der Platz nicht, links davon. Wer ein Fenster verschiebt, loest es bis zum Schliessen.
+local docked = {}
+
+relayoutDocks = function()
+	if not frame or not frame:IsShown() then return end
+	local sw = UIParent:GetWidth() * UIParent:GetEffectiveScale()
+	local right, left = frame, frame
+	for _, f in ipairs(docked) do
+		if f:IsShown() and not f.csMoved then
+			local es = f:GetEffectiveScale()
+			local w = f:GetWidth() * es
+			local r = (right:GetRight() or 0) * right:GetEffectiveScale()
+			f:ClearAllPoints()
+			if r + 6 * es + w <= sw then
+				f:SetPoint("TOPLEFT", right, "TOPRIGHT", 6, 0)
+				right = f
+			else
+				f:SetPoint("TOPRIGHT", left, "TOPLEFT", -6, 0)
+				left = f
+			end
+		end
+	end
+end
+
+-- Kanten eines Fensters in Bildschirmpunkten
+local function edges(f)
+	local es = f:GetEffectiveScale()
+	return (f:GetLeft() or 0) * es, (f:GetRight() or 0) * es, (f:GetTop() or 0) * es, (f:GetBottom() or 0) * es
+end
+
+-- Wurde ein Fenster nahe an das Hauptfenster (oder ein angedocktes Fenster) gezogen? Dann daran einrasten.
+local SNAP = 15
+local function snapTarget(f)
+	if not frame or not frame:IsShown() then return end
+	local l, r, t, b = edges(f)
+	local cands = { frame }
+	for _, g in ipairs(docked) do
+		if g ~= f and g:IsShown() and not g.csMoved then cands[#cands + 1] = g end
+	end
+	local best, dist
+	for _, c in ipairs(cands) do
+		local cl, cr, ct, cb = edges(c)
+		if t > cb and b < ct then -- uebereinander liegende Bereiche
+			for _, d in ipairs({ math.abs(l - cr), math.abs(r - cl) }) do
+				if d < SNAP and (not dist or d < dist) then best, dist = c, d end
+			end
+		end
+	end
+	return best
+end
+
+function UI.Dockable(f)
+	if not f or f.csDock then return end
+	f.csDock = true
+	local home = { f:GetPoint(1) }
+	-- alle Zusatzfenster in derselben Ebene, das angeklickte/verschobene liegt ganz oben (ohne Durchscheinen)
+	f:SetFrameStrata("DIALOG")
+	f:SetToplevel(true)
+	f:HookScript("OnMouseDown", function(self) self:Raise() end)
+	f:HookScript("OnDragStart", function(self) self:Raise() end)
+	f:HookScript("OnShow", function(self)
+		for i, g in ipairs(docked) do if g == self then table.remove(docked, i) break end end
+		docked[#docked + 1] = self -- zuletzt geoeffnet = ganz aussen
+		self.csMoved = nil
+		self:Raise()
+		if frame and frame:IsShown() then
+			relayoutDocks()
+		elseif home[1] and self:GetNumPoints() > 0 and select(2, self:GetPoint(1)) == frame then
+			-- Hauptfenster zu: an den eigenen Platz
+			self:ClearAllPoints()
+			self:SetPoint(unpack(home))
+		end
+	end)
+	f:HookScript("OnHide", function() relayoutDocks() end)
+	f:HookScript("OnDragStop", function(self)
+		local target = snapTarget(self)
+		if target then
+			-- neben dem Ziel einreihen
+			for i, g in ipairs(docked) do if g == self then table.remove(docked, i) break end end
+			local pos = 1
+			for i, g in ipairs(docked) do if g == target then pos = i + 1 end end
+			table.insert(docked, pos, self)
+			self.csMoved = nil
+		else
+			self.csMoved = true
+		end
+		relayoutDocks()
+	end)
+	if f:IsShown() then relayoutDocks() end
 end
 
 function UI.Toggle()

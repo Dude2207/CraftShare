@@ -436,7 +436,7 @@ function PC.ShiftClick(id)
 		if _G.ChatFrameUtil and _G.ChatFrameUtil.OpenChat then _G.ChatFrameUtil.OpenChat(link)
 		else ChatFrame_OpenChat(link) end
 	end)
-	if not ok then print("|cff4fd05aCraftShare|r: " .. tostring(err)) end
+	if not ok then print("|cff4fd05aGuild CraftShare|r: " .. tostring(err)) end
 end
 
 function PC.HasAuctionator()
@@ -444,25 +444,30 @@ function PC.HasAuctionator()
 	return A and A.API and A.API.v1 and A.API.v1.CreateShoppingList and A.API.v1.ConvertToSearchString and true or false
 end
 
-function PC.SendToAuctionator()
-	if not PC.HasAuctionator() or #shopItems == 0 then return end
+-- Einkaufsliste in Auctionator anlegen: items = { { id = Gegenstand, n = Menge }, ... }
+function PC.CreateList(title, items)
+	if not PC.HasAuctionator() or #items == 0 then return end
 	local api = _G.Auctionator.API.v1
 	local terms = {}
-	for _, it in ipairs(shopItems) do
+	for _, it in ipairs(items) do
 		local name = ns.ItemName(it.id)
 		if name then
 			local ok, str = pcall(api.ConvertToSearchString, "CraftShare", { searchString = name, isExact = true, quantity = it.n })
 			if ok and str then terms[#terms + 1] = str end
 		end
 	end
-	if #terms == 0 then print("|cff4fd05aCraftShare|r: " .. T("Keine Gegenstandsnamen verfügbar.", "No item names available.")) return end
-	local listName = "CraftShare: " .. (cur and cur.name or "")
+	if #terms == 0 then print("|cff4fd05aGuild CraftShare|r: " .. T("Keine Gegenstandsnamen verfügbar.", "No item names available.")) return end
+	local listName = "Guild CraftShare: " .. (title or "")
 	local ok, err = pcall(api.CreateShoppingList, "CraftShare", listName, terms)
 	if ok then
-		print("|cff4fd05aCraftShare|r: " .. T("Einkaufsliste an Auctionator gesendet: ", "Shopping list sent to Auctionator: ") .. listName)
+		print("|cff4fd05aGuild CraftShare|r: " .. T("Einkaufsliste an Auctionator gesendet: ", "Shopping list sent to Auctionator: ") .. listName)
 	else
-		print("|cff4fd05aCraftShare|r: " .. tostring(err))
+		print("|cff4fd05aGuild CraftShare|r: " .. tostring(err))
 	end
+end
+
+function PC.SendToAuctionator()
+	PC.CreateList(cur and cur.name or "", shopItems)
 end
 
 function PC.Toggle()
@@ -470,7 +475,10 @@ function PC.Toggle()
 end
 
 function PC.Open()
-	if not frame then create() end
+	if not frame then
+		create()
+		ns.UI.Dockable(frame)
+	end
 	frame:Show()
 	curKey = nil
 	PC.Refresh()

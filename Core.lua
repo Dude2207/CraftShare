@@ -1,6 +1,6 @@
 -- CraftShare: Kern (Namespace, Datenbank, Hilfsfunktionen, Slash-Befehle)
 local ADDON, ns = ...
-ns.VERSION = "0.3.0"
+ns.VERSION = "0.4.0"
 ns.PREFIX = "CraftShare"
 
 local L = {}
@@ -9,8 +9,48 @@ local isDE = (GetLocale and GetLocale() == "deDE")
 local function T(de, en) return isDE and de or en end
 ns.T = T
 
+-- ---------------------------------------------------------------- Versionen
+ns.DOWNLOAD = "github.com/Dude2207/CraftShare/releases"
+
+local function versionParts(v)
+	local t = {}
+	for n in tostring(v or ""):gmatch("%d+") do t[#t + 1] = tonumber(n) end
+	return t
+end
+
+-- >0, wenn a neuer ist als b
+function ns.CompareVersions(a, b)
+	local x, y = versionParts(a), versionParts(b)
+	for i = 1, math.max(#x, #y) do
+		local d = (x[i] or 0) - (y[i] or 0)
+		if d ~= 0 then return d end
+	end
+	return 0
+end
+
+-- ein anderer Spieler meldet seine Version; die neueste, die neuer als die eigene ist, wird gemerkt
+function ns.NoteVersion(name, ver)
+	if not ns.db or type(ver) ~= "string" or not ver:match("^%d+%.%d+") or #ver > 12 then return end
+	if ns.CompareVersions(ver, ns.VERSION) <= 0 then return end
+	local nv = ns.db.newerVersion
+	if nv and ns.CompareVersions(nv.v, ver) >= 0 then return end
+	ns.db.newerVersion = { v = ver, by = name, t = time() }
+	if ns.UI and ns.UI.Dirty then ns.UI.Dirty() end
+end
+
+-- { v, by } oder nil, wenn niemand eine neuere Version hat
+function ns.NewerVersion()
+	local nv = ns.db and ns.db.newerVersion
+	if not nv then return nil end
+	if ns.CompareVersions(nv.v, ns.VERSION) <= 0 then
+		ns.db.newerVersion = nil -- inzwischen selbst aktualisiert
+		return nil
+	end
+	return nv
+end
+
 function ns.Print(msg)
-	print("|cff33ccffCraftShare|r: " .. tostring(msg))
+	print("|cff33ccffGuild CraftShare|r: " .. tostring(msg))
 end
 
 -- Spielername ohne Realm. In WoW Forever haben Spieler Vor- UND Nachnamen ("Vorname Nachname"),
@@ -214,6 +254,7 @@ frame:SetScript("OnEvent", function(self, ev, name)
 	initDB()
 	if ns.Comm and ns.Comm.Init then ns.Comm.Init() end
 	if ns.Scan and ns.Scan.Init then ns.Scan.Init() end
+	if ns.Relay and ns.Relay.Init then ns.Relay.Init() end
 	if ns.Orders and ns.Orders.Init then ns.Orders.Init() end
 	if ns.Mini and ns.Mini.Init then ns.Mini.Init() end
 	C_Timer.After(2, ns.ResolveSelf)
@@ -228,11 +269,11 @@ SlashCmdList["CRAFTSHARE"] = function(msg)
 	if cmd == "" or cmd == "show" or cmd == "toggle" then
 		ns.UI.Toggle()
 	elseif cmd == "add" then
-		if rest == "" then return ns.Print(T("Aufruf: /cs add <Name> (Freund, der CraftShare nutzt)", "Usage: /cs add <name> (a friend running CraftShare)")) end
+		if rest == "" then return ns.Print(T("Aufruf: /cs add <Name> (Freund, der Guild CraftShare nutzt)", "Usage: /cs add <name> (a friend running Guild CraftShare)")) end
 		ns.db.friends[ns.ShortName(rest)] = true
 		ns.Print(T("Freund hinzugefügt: ", "Friend added: ") .. ns.ShortName(rest))
 		ns.Comm.Request("WHISPER", ns.ShortName(rest))
-		ns.Comm.SendOwn("WHISPER", ns.ShortName(rest))
+		ns.Comm.SendDigest("WHISPER", ns.ShortName(rest))
 	elseif cmd == "remove" or cmd == "del" then
 		ns.db.friends[ns.ShortName(rest)] = nil
 		ns.Print(T("Freund entfernt: ", "Friend removed: ") .. ns.ShortName(rest))
@@ -243,7 +284,7 @@ SlashCmdList["CRAFTSHARE"] = function(msg)
 		ns.Print(T("Freunde: ", "Friends: ") .. (#t > 0 and table.concat(t, ", ") or "-"))
 	elseif cmd == "sync" then
 		ns.Comm.Request()
-		ns.Comm.SendOwn()
+		ns.Comm.SendDigest()
 		ns.Print(T("Synchronisation angefordert.", "Sync requested."))
 	elseif cmd == "post" then
 		ns.Mail.Debug()
@@ -281,7 +322,7 @@ SlashCmdList["CRAFTSHARE"] = function(msg)
 end
 
 -- ---------------------------------------------------------------- Tastenbelegung
-BINDING_HEADER_CRAFTSHARE = "CraftShare"
+BINDING_HEADER_CRAFTSHARE = "Guild CraftShare"
 BINDING_NAME_CRAFTSHARE_TOGGLE = ns.T("Fenster ein-/ausblenden", "Toggle window")
 
 function CraftShare_Toggle()
@@ -299,7 +340,7 @@ keyFrame:SetScript("OnEvent", function(self)
 	local old = GetBindingAction("G")
 	SetBinding("G", "CRAFTSHARE_TOGGLE")
 	if old and old ~= "" and old ~= "CRAFTSHARE_TOGGLE" then
-		ns.Print(ns.T("Taste G öffnet jetzt CraftShare (vorher belegt mit: ", "Key G now opens CraftShare (was bound to: ") .. old .. ")")
+		ns.Print(ns.T("Taste G öffnet jetzt Guild CraftShare (vorher belegt mit: ", "Key G now opens Guild CraftShare (was bound to: ") .. old .. ")")
 	end
 	if SaveBindings and GetCurrentBindingSet then SaveBindings(GetCurrentBindingSet()) end
 end)
